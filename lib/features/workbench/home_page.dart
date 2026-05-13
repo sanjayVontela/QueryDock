@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:panes/panes.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../database/models/database_schema.dart';
 import '../database/services/postgres_database.dart';
@@ -20,6 +21,9 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
+  static const String _showAllSqlScriptsKey = 'workbench.sql_scripts.show_all';
+  static const String _globalScriptConnectionKey = 'global';
+
   late final IdeController _controller;
   final PostgresConnectionStore _connectionStore = PostgresConnectionStore();
 
@@ -27,6 +31,7 @@ class _MyHomePageState extends State<MyHomePage> {
   bool _isExecuting = false;
   bool _isConnected = false;
   bool _isConnecting = false;
+  bool _showAllSqlScripts = false;
 
   String _activeConnection = 'No Connection';
   String _activeSchema = '-';
@@ -41,6 +46,8 @@ class _MyHomePageState extends State<MyHomePage> {
   final List<_OpenConnection> _connections = [];
   final List<_SqlScriptTab> _sqlTabs = [];
   final List<_OpenTableTab> _openTableTabs = [];
+  final Set<String> _loadingSchemas = {};
+  final Set<String> _loadingTables = {};
 
   final ValueNotifier<String> _activeResultTab = ValueNotifier('Data');
 
@@ -56,7 +63,7 @@ class _MyHomePageState extends State<MyHomePage> {
     );
 
     _logs = ['[INFO] DB Viewer started', '[INFO] No database connected'];
-    _loadSqlScripts();
+    _initializeSqlEditor();
   }
 
   @override
@@ -113,6 +120,7 @@ class _MyHomePageState extends State<MyHomePage> {
         _status = 'Connected';
         _columns = [];
         _rows = [];
+        _filterSqlTabsForActiveConnection();
         _logs.add('[INFO] Connected to ${config.database}');
         _logs.add('[INFO] Loaded ${schemas.length} schemas');
       });
@@ -235,12 +243,27 @@ class _MyHomePageState extends State<MyHomePage> {
     _showResultTab('Messages');
   }
 
+  Future<void> _initializeSqlEditor() async {
+    final preferences = await SharedPreferences.getInstance();
+    final showAll = preferences.getBool(_showAllSqlScriptsKey) ?? false;
+
+    if (!mounted) return;
+
+    setState(() {
+      _showAllSqlScripts = showAll;
+      _sqlTabs.add(_SqlScriptTab(title: 'SQL Editor', text: ''));
+      _activeCenterTab = 0;
+      _logs.add('[INFO] SQL editor ready');
+    });
+  }
+
   Future<void> _newSqlScript() async {
-    final scriptsDirectory = await _sqlScriptsDirectory();
+    final scriptsDirectory = await _sqlScriptsDirectoryForActiveConnection();
     final title = _nextSqlScriptTitle(scriptsDirectory);
     final script = _SqlScriptTab(
       title: title,
-      file: File('${scriptsDirectory.path}${Platform.pathSeparator}$title.sql'),
+      file: File(_scriptPath(scriptsDirectory, title)),
+      connectionKey: _activeScriptConnectionKey,
       text: '',
     );
 
@@ -251,52 +274,47 @@ class _MyHomePageState extends State<MyHomePage> {
     });
   }
 
-  Future<void> _loadSqlScripts() async {
-    final scriptsDirectory = await _sqlScriptsDirectory();
-    final files =
-        scriptsDirectory
-            .listSync()
-            .whereType<File>()
-            .where((file) => file.path.toLowerCase().endsWith('.sql'))
-            .toList()
-          ..sort((a, b) => a.path.compareTo(b.path));
-
-    final scripts = <_SqlScriptTab>[];
-    for (final file in files) {
-      scripts.add(
-        _SqlScriptTab(
-          title: _fileNameWithoutExtension(file),
-          file: file,
-          text: await file.readAsString(),
-        ),
-      );
-    }
-
-    if (scripts.isEmpty) {
-      final file = File(
-        '${scriptsDirectory.path}${Platform.pathSeparator}SQL Script 1.sql',
-      );
-      scripts.add(
-        _SqlScriptTab(
-          title: 'SQL Script 1',
-          file: file,
-          text: '''SELECT current_database() AS database_name,
-       current_user AS connected_user,
-       version() AS postgres_version;''',
-        ),
-      );
-    }
+  Future<void> _selectSqlScript() async {
+    final scripts = await _availableSqlScripts();
 
     if (!mounted) return;
 
+    final selected = await showDialog<_SqlScriptFile>(
+      context: context,
+      builder: (context) => _SqlScriptPickerDialog(
+        scripts: scripts,
+        showAllScripts: _showAllSqlScripts,
+        onShowAllChanged: _setShowAllSqlScripts,
+        loadScripts: _availableSqlScripts,
+      ),
+    );
+
+    if (selected == null) return;
+
+    final text = await selected.file.readAsString();
+    final tab = _SqlScriptTab(
+      title: _fileNameWithoutExtension(selected.file),
+      file: selected.file,
+      connectionKey: selected.connectionKey,
+      text: text,
+    );
+
     setState(() {
-      _sqlTabs.addAll(scripts);
-      _activeCenterTab = 0;
-      _logs.add('[INFO] Loaded ${scripts.length} SQL script files');
+      final existingIndex = _sqlTabs.indexWhere(
+        (script) => script.file?.path == selected.file.path,
+      );
+      if (existingIndex == -1) {
+        _sqlTabs.add(tab);
+        _activeCenterTab = _sqlTabs.length - 1;
+      } else {
+        tab.dispose();
+        _activeCenterTab = existingIndex;
+      }
+      _logs.add('[INFO] Opened SQL script: ${selected.file.path}');
     });
   }
 
-  Future<Directory> _sqlScriptsDirectory() async {
+  Future<Directory> _sqlScriptsRootDirectory() async {
     final appDirectory = await getApplicationSupportDirectory();
     final scriptsDirectory = Directory(
       '${appDirectory.path}${Platform.pathSeparator}sql_scripts',
@@ -307,6 +325,64 @@ class _MyHomePageState extends State<MyHomePage> {
     }
 
     return scriptsDirectory;
+  }
+
+  Future<Directory> _sqlScriptsDirectoryForActiveConnection() {
+    return _sqlScriptsDirectoryForConnection(_activeScriptConnectionKey);
+  }
+
+  Future<Directory> _sqlScriptsDirectoryForConnection(
+    String connectionKey,
+  ) async {
+    final root = await _sqlScriptsRootDirectory();
+    final directory = Directory(
+      '${root.path}${Platform.pathSeparator}${_safeFileSegment(connectionKey)}',
+    );
+
+    if (!directory.existsSync()) {
+      directory.createSync(recursive: true);
+    }
+
+    return directory;
+  }
+
+  Future<List<_SqlScriptFile>> _availableSqlScripts() async {
+    final root = await _sqlScriptsRootDirectory();
+    final activeKey = _activeScriptConnectionKey;
+    final files = <_SqlScriptFile>[];
+
+    if (_showAllSqlScripts) {
+      for (final directory in root.listSync().whereType<Directory>()) {
+        final connectionKey = _connectionKeyFromDirectory(directory);
+        files.addAll(_sqlFilesInDirectory(directory, connectionKey));
+      }
+      files.addAll(_sqlFilesInDirectory(root, _globalScriptConnectionKey));
+    } else {
+      final activeDirectory = await _sqlScriptsDirectoryForConnection(
+        activeKey,
+      );
+      files.addAll(_sqlFilesInDirectory(activeDirectory, activeKey));
+    }
+
+    files.sort((a, b) => a.label.compareTo(b.label));
+    return files;
+  }
+
+  List<_SqlScriptFile> _sqlFilesInDirectory(
+    Directory directory,
+    String connectionKey,
+  ) {
+    return [
+      if (directory.existsSync())
+        for (final file in directory.listSync().whereType<File>())
+          if (file.path.toLowerCase().endsWith('.sql'))
+            _SqlScriptFile(file: file, connectionKey: connectionKey),
+    ];
+  }
+
+  String _connectionKeyFromDirectory(Directory directory) {
+    final segments = directory.path.split(Platform.pathSeparator);
+    return segments.isEmpty ? directory.path : segments.last;
   }
 
   String _nextSqlScriptTitle(Directory scriptsDirectory) {
@@ -344,6 +420,57 @@ class _MyHomePageState extends State<MyHomePage> {
     return 'SQL Script $index';
   }
 
+  String _scriptPath(Directory directory, String title) {
+    final safeTitle = title.toLowerCase().endsWith('.sql')
+        ? title.substring(0, title.length - 4)
+        : title;
+    return '${directory.path}${Platform.pathSeparator}$safeTitle.sql';
+  }
+
+  Future<void> _setShowAllSqlScripts(bool value) async {
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool(_showAllSqlScriptsKey, value);
+    if (!mounted) return;
+    setState(() {
+      _showAllSqlScripts = value;
+      if (!value) {
+        _filterSqlTabsForActiveConnection();
+      }
+      _logs.add(
+        '[INFO] ${value ? 'Showing all SQL scripts' : 'Showing current connection SQL scripts'}',
+      );
+    });
+  }
+
+  Future<String?> _promptForScriptName(String initialName) {
+    final controller = TextEditingController(text: initialName);
+    return showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Save SQL Script'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'Script name',
+            suffixText: '.sql',
+          ),
+          onSubmitted: (value) => Navigator.of(context).pop(value),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    ).whenComplete(controller.dispose);
+  }
+
   String _fileNameWithoutExtension(File file) {
     final segments = file.path.split(Platform.pathSeparator);
     final name = segments.isEmpty ? file.path : segments.last;
@@ -355,11 +482,35 @@ class _MyHomePageState extends State<MyHomePage> {
     final tab = _activeSqlTab;
     if (tab == null) return;
 
+    if (tab.file == null) {
+      final scriptsDirectory = await _sqlScriptsDirectoryForActiveConnection();
+      final name = await _promptForScriptName(
+        tab.title == 'SQL Editor'
+            ? _nextSqlScriptTitle(scriptsDirectory)
+            : tab.title,
+      );
+      final normalizedName = _normalizeScriptName(name);
+      if (normalizedName == null) return;
+      tab.title = normalizedName;
+      tab.file = File(_scriptPath(scriptsDirectory, normalizedName));
+      tab.connectionKey = _activeScriptConnectionKey;
+    }
+
     await tab.save();
 
     setState(() {
-      _logs.add('[INFO] Saved SQL script: ${tab.file.path}');
+      _logs.add('[INFO] Saved SQL script: ${tab.file?.path}');
     });
+  }
+
+  String? _normalizeScriptName(String? name) {
+    final trimmed = name?.trim() ?? '';
+    if (trimmed.isEmpty) return null;
+    final withoutExtension = trimmed.toLowerCase().endsWith('.sql')
+        ? trimmed.substring(0, trimmed.length - 4).trim()
+        : trimmed;
+    if (withoutExtension.isEmpty) return null;
+    return withoutExtension.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
   }
 
   void _closeSqlTab(_SqlScriptTab tab) {
@@ -519,16 +670,39 @@ class _MyHomePageState extends State<MyHomePage> {
     String schema, {
     bool forceRefresh = false,
   }) async {
-    final tables = await connection.database.loadSchemaTables(
-      schema,
-      forceRefresh: forceRefresh,
-    );
+    final loadingKey = _schemaLoadingKey(connection, schema);
+    if (_loadingSchemas.contains(loadingKey)) return;
 
     if (!mounted) return;
     setState(() {
-      _replaceSchema(connection, schema, tables, tablesLoaded: true);
-      _logs.add('[INFO] Loaded ${tables.length} tables for schema $schema');
+      _loadingSchemas.add(loadingKey);
+      _logs.add('[INFO] Loading tables for schema $schema');
     });
+
+    try {
+      final tables = await connection.database.loadSchemaTables(
+        schema,
+        forceRefresh: forceRefresh,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _replaceSchema(connection, schema, tables, tablesLoaded: true);
+        _logs.add('[INFO] Loaded ${tables.length} tables for schema $schema');
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _logs.add('[ERROR] Failed to load tables for schema $schema: $error');
+      });
+      _showResultTab('Messages');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingSchemas.remove(loadingKey);
+        });
+      }
+    }
   }
 
   Future<void> _loadTableColumns(
@@ -539,19 +713,56 @@ class _MyHomePageState extends State<MyHomePage> {
     final database = _database;
     if (database == null) return;
 
-    final loadedTable = await database.loadTableColumns(
-      schema,
-      table.name,
-      forceRefresh: forceRefresh,
-    );
+    final loadingKey = _tableLoadingKey(database, schema, table.name);
+    if (_loadingTables.contains(loadingKey)) return;
 
     if (!mounted) return;
     setState(() {
-      _replaceTableInActiveConnection(schema, loadedTable);
-      _logs.add(
-        '[INFO] Loaded ${loadedTable.columns.length} columns for $schema.${table.name}',
-      );
+      _loadingTables.add(loadingKey);
+      _logs.add('[INFO] Loading columns for $schema.${table.name}');
     });
+
+    try {
+      final loadedTable = await database.loadTableColumns(
+        schema,
+        table.name,
+        forceRefresh: forceRefresh,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _replaceTableInActiveConnection(schema, loadedTable);
+        _logs.add(
+          '[INFO] Loaded ${loadedTable.columns.length} columns for $schema.${table.name}',
+        );
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _logs.add(
+          '[ERROR] Failed to load columns for $schema.${table.name}: $error',
+        );
+      });
+      _showResultTab('Messages');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingTables.remove(loadingKey);
+        });
+      }
+    }
+  }
+
+  String _schemaLoadingKey(_OpenConnection connection, String schema) {
+    return '${identityHashCode(connection.database)}.$schema';
+  }
+
+  String _tableLoadingKey(
+    PostgresDatabase database,
+    String schema,
+    String table,
+  ) {
+    return '${identityHashCode(database)}.$schema.$table';
   }
 
   void _replaceSchema(
@@ -694,7 +905,7 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       for (final connection in _connections) {
         if (connection.database == database) {
-          connection.schemas = schemas;
+          connection.schemas = List<DatabaseSchema>.of(schemas);
           break;
         }
       }
@@ -711,8 +922,31 @@ class _MyHomePageState extends State<MyHomePage> {
           : connection.schemas.first.name;
       _activeDriver = 'postgres ${connection.database.config.sslMode.name}';
       _status = 'Connected';
+      _filterSqlTabsForActiveConnection();
       _logs.add('[INFO] Activated connection: $_activeConnection');
     });
+  }
+
+  void _filterSqlTabsForActiveConnection() {
+    if (_showAllSqlScripts) return;
+    final activeKey = _activeScriptConnectionKey;
+    for (var index = _sqlTabs.length - 1; index >= 0; index--) {
+      final tab = _sqlTabs[index];
+      if (tab.file != null && tab.connectionKey != activeKey) {
+        _sqlTabs.removeAt(index);
+        tab.dispose();
+        if (_activeCenterTab > index) {
+          _activeCenterTab--;
+        }
+      }
+    }
+
+    if (_sqlTabs.isEmpty) {
+      _sqlTabs.add(_SqlScriptTab(title: 'SQL Editor', text: ''));
+      _activeCenterTab = 0;
+    } else if (_activeCenterTab >= _sqlTabs.length) {
+      _activeCenterTab = _sqlTabs.length - 1;
+    }
   }
 
   void _selectSchema(String schema) {
@@ -844,6 +1078,16 @@ class _MyHomePageState extends State<MyHomePage> {
 
   int get _tableTabOffset => _sqlTabs.length;
 
+  String get _activeScriptConnectionKey {
+    final database = _database;
+    if (database == null) return _globalScriptConnectionKey;
+    return database.config.displayName;
+  }
+
+  String _safeFileSegment(String value) {
+    return value.replaceAll(RegExp(r'[\\/:*?"<>|@ ]'), '_');
+  }
+
   String _quoteIdentifier(String identifier) {
     return '"${identifier.replaceAll('"', '""')}"';
   }
@@ -925,7 +1169,11 @@ class _MyHomePageState extends State<MyHomePage> {
           body: Column(
             children: [
               AppTitleBar(connectionName: _activeConnection, status: _status),
-              const DbMenuBar(),
+              DbMenuBar(
+                onNewSql: _newSqlScript,
+                onSelectSql: _selectSqlScript,
+                onSaveSql: _saveSql,
+              ),
               DbToolbar(
                 isExecuting: _isExecuting,
                 isConnecting: _isConnecting,
@@ -933,7 +1181,6 @@ class _MyHomePageState extends State<MyHomePage> {
                 onNewSql: _newSqlScript,
                 onExecute: _isExecuting || _isConnecting ? null : _executeSql,
                 onStop: _stopQuery,
-                onSave: _saveSql,
                 onToggleNavigator: () {
                   setState(() {
                     _controller.toggleLeft();
@@ -1024,6 +1271,9 @@ class _MyHomePageState extends State<MyHomePage> {
                     onActivate: () => _activateConnection(connection),
                     schemaBuilder: (schema) => _SchemaTreeItem(
                       schema: schema,
+                      isLoading: _loadingSchemas.contains(
+                        _schemaLoadingKey(connection, schema.name),
+                      ),
                       onExpand: () {
                         _activateConnection(connection);
                         return _loadSchemaTables(connection, schema.name);
@@ -1039,6 +1289,13 @@ class _MyHomePageState extends State<MyHomePage> {
                         return _TableTreeItem(
                           schema: schema.name,
                           table: table,
+                          isLoading: _loadingTables.contains(
+                            _tableLoadingKey(
+                              connection.database,
+                              schema.name,
+                              table.name,
+                            ),
+                          ),
                           onExpand: (schema, table) {
                             _activateConnection(connection);
                             return _loadTableColumns(schema, table);
@@ -1369,16 +1626,130 @@ class _OpenTableTab {
   }
 }
 
-class _SqlScriptTab {
-  final String title;
+class _SqlScriptFile {
   final File file;
+  final String connectionKey;
+
+  const _SqlScriptFile({required this.file, required this.connectionKey});
+
+  String get title {
+    final segments = file.path.split(Platform.pathSeparator);
+    final name = segments.isEmpty ? file.path : segments.last;
+    return name.toLowerCase().endsWith('.sql')
+        ? name.substring(0, name.length - 4)
+        : name;
+  }
+
+  String get label => '$connectionKey / $title';
+}
+
+class _SqlScriptPickerDialog extends StatefulWidget {
+  final List<_SqlScriptFile> scripts;
+  final bool showAllScripts;
+  final Future<void> Function(bool value) onShowAllChanged;
+  final Future<List<_SqlScriptFile>> Function() loadScripts;
+
+  const _SqlScriptPickerDialog({
+    required this.scripts,
+    required this.showAllScripts,
+    required this.onShowAllChanged,
+    required this.loadScripts,
+  });
+
+  @override
+  State<_SqlScriptPickerDialog> createState() => _SqlScriptPickerDialogState();
+}
+
+class _SqlScriptPickerDialogState extends State<_SqlScriptPickerDialog> {
+  late bool _showAllScripts = widget.showAllScripts;
+  late List<_SqlScriptFile> _scripts = widget.scripts;
+  bool _isRefreshing = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Select SQL Script'),
+      content: SizedBox(
+        width: 520,
+        height: 360,
+        child: Column(
+          children: [
+            CheckboxListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Show scripts for all connections'),
+              value: _showAllScripts,
+              onChanged: (value) async {
+                final nextValue = value ?? false;
+                setState(() {
+                  _showAllScripts = nextValue;
+                  _isRefreshing = true;
+                });
+                await widget.onShowAllChanged(nextValue);
+                final scripts = await widget.loadScripts();
+                if (mounted) {
+                  setState(() {
+                    _scripts = scripts;
+                    _isRefreshing = false;
+                  });
+                }
+              },
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: _isRefreshing
+                  ? const Center(child: CircularProgressIndicator())
+                  : _scripts.isEmpty
+                  ? const Center(
+                      child: Text(
+                        'No saved scripts for this selection.',
+                        style: TextStyle(color: Colors.black54),
+                      ),
+                    )
+                  : ListView.builder(
+                      itemCount: _scripts.length,
+                      itemBuilder: (context, index) {
+                        final script = _scripts[index];
+                        return ListTile(
+                          dense: true,
+                          leading: const Icon(Icons.description, size: 18),
+                          title: Text(script.title),
+                          subtitle: Text(script.connectionKey),
+                          onTap: () => Navigator.of(context).pop(script),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+      ],
+    );
+  }
+}
+
+class _SqlScriptTab {
+  String title;
+  File? file;
+  String connectionKey;
   final TextEditingController controller;
   final FocusNode focusNode = FocusNode();
 
-  _SqlScriptTab({required this.title, required this.file, required String text})
-    : controller = TextEditingController(text: text);
+  _SqlScriptTab({
+    required this.title,
+    this.file,
+    this.connectionKey = _MyHomePageState._globalScriptConnectionKey,
+    required String text,
+  }) : controller = TextEditingController(text: text);
 
   Future<void> save() async {
+    final file = this.file;
+    if (file == null) return;
     final parent = file.parent;
     if (!parent.existsSync()) {
       parent.createSync(recursive: true);
@@ -1396,7 +1767,10 @@ class _OpenConnection {
   final PostgresDatabase database;
   List<DatabaseSchema> schemas;
 
-  _OpenConnection({required this.database, required this.schemas});
+  _OpenConnection({
+    required this.database,
+    required List<DatabaseSchema> schemas,
+  }) : schemas = List<DatabaseSchema>.of(schemas);
 }
 
 class _ConnectionTreeItem extends StatelessWidget {
@@ -1443,8 +1817,9 @@ class _ConnectionTreeItem extends StatelessWidget {
   }
 }
 
-class _SchemaTreeItem extends StatelessWidget {
+class _SchemaTreeItem extends StatefulWidget {
   final DatabaseSchema schema;
+  final bool isLoading;
   final Future<void> Function() onExpand;
   final void Function(String schema) onSelectSchema;
   final VoidCallback onRefresh;
@@ -1453,12 +1828,37 @@ class _SchemaTreeItem extends StatelessWidget {
 
   const _SchemaTreeItem({
     required this.schema,
+    required this.isLoading,
     required this.onExpand,
     required this.onSelectSchema,
     required this.onRefresh,
     required this.onCopyName,
     required this.tableBuilder,
   });
+
+  @override
+  State<_SchemaTreeItem> createState() => _SchemaTreeItemState();
+}
+
+class _SchemaTreeItemState extends State<_SchemaTreeItem> {
+  bool _loadQueued = false;
+
+  @override
+  void didUpdateWidget(covariant _SchemaTreeItem oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.schema.tablesLoaded || widget.isLoading) {
+      _loadQueued = false;
+    }
+  }
+
+  void _requestLoad() {
+    if (widget.schema.tablesLoaded || widget.isLoading || _loadQueued) return;
+    _loadQueued = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(widget.onExpand().whenComplete(() => _loadQueued = false));
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1476,42 +1876,54 @@ class _SchemaTreeItem extends StatelessWidget {
         switch (value) {
           case 'select':
           case 'properties':
-            onSelectSchema(schema.name);
+            widget.onSelectSchema(widget.schema.name);
             break;
           case 'refresh':
-            onRefresh();
+            widget.onRefresh();
             break;
           case 'copy':
-            onCopyName(schema.name);
+            widget.onCopyName(widget.schema.name);
             break;
         }
       },
       child: ExpansionTile(
+        key: PageStorageKey('schema-${widget.schema.name}'),
         dense: true,
         initiallyExpanded: false,
         onExpansionChanged: (expanded) {
-          if (expanded && !schema.tablesLoaded) {
-            onExpand();
+          if (expanded) {
+            _requestLoad();
           }
         },
         tilePadding: const EdgeInsets.only(left: 22, right: 8),
         leading: const Icon(Icons.folder, size: 16, color: Colors.blueGrey),
         title: _HoverTitle(
-          child: Text(schema.name, style: const TextStyle(fontSize: 13)),
+          child: Text(widget.schema.name, style: const TextStyle(fontSize: 13)),
         ),
         children: [
-          if (!schema.tablesLoaded)
-            const Padding(
-              padding: EdgeInsets.only(left: 58, right: 8, bottom: 8),
+          if (!widget.schema.tablesLoaded)
+            Padding(
+              padding: const EdgeInsets.only(left: 58, right: 8, bottom: 8),
               child: Align(
                 alignment: Alignment.centerLeft,
-                child: Text(
-                  'Expand to load tables.',
-                  style: TextStyle(fontSize: 12, color: Colors.black54),
-                ),
+                child: widget.isLoading
+                    ? const Text(
+                        'Loading tables...',
+                        style: TextStyle(fontSize: 12, color: Colors.black54),
+                      )
+                    : TextButton.icon(
+                        onPressed: _requestLoad,
+                        icon: const Icon(Icons.refresh, size: 14),
+                        label: const Text('Load tables'),
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          textStyle: const TextStyle(fontSize: 12),
+                        ),
+                      ),
               ),
             ),
-          if (schema.tablesLoaded && schema.tables.isEmpty)
+          if (widget.schema.tablesLoaded && widget.schema.tables.isEmpty)
             const Padding(
               padding: EdgeInsets.only(left: 58, right: 8, bottom: 8),
               child: Align(
@@ -1522,7 +1934,7 @@ class _SchemaTreeItem extends StatelessWidget {
                 ),
               ),
             ),
-          for (final table in schema.tables) tableBuilder(table),
+          for (final table in widget.schema.tables) widget.tableBuilder(table),
         ],
       ),
     );
@@ -1532,6 +1944,7 @@ class _SchemaTreeItem extends StatelessWidget {
 class _TableTreeItem extends StatelessWidget {
   final String schema;
   final DatabaseTable table;
+  final bool isLoading;
   final Future<void> Function(String schema, DatabaseTable table) onExpand;
   final void Function(String schema, String table) onOpenTable;
   final Future<void> Function(
@@ -1550,6 +1963,7 @@ class _TableTreeItem extends StatelessWidget {
   const _TableTreeItem({
     required this.schema,
     required this.table,
+    required this.isLoading,
     required this.onExpand,
     required this.onOpenTable,
     required this.onGenerateSql,
@@ -1601,8 +2015,10 @@ class _TableTreeItem extends StatelessWidget {
       child: ExpansionTile(
         dense: true,
         onExpansionChanged: (expanded) {
-          if (expanded && !table.columnsLoaded) {
-            onExpand(schema, table);
+          if (expanded && !table.columnsLoaded && !isLoading) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              onExpand(schema, table);
+            });
           }
         },
         tilePadding: const EdgeInsets.only(left: 58, right: 8),
@@ -1633,13 +2049,22 @@ class _TableTreeItem extends StatelessWidget {
             title: const Text('Columns', style: TextStyle(fontSize: 13)),
             children: [
               if (!table.columnsLoaded)
-                const Padding(
-                  padding: EdgeInsets.only(left: 116, right: 8, bottom: 8),
+                Padding(
+                  padding: const EdgeInsets.only(
+                    left: 116,
+                    right: 8,
+                    bottom: 8,
+                  ),
                   child: Align(
                     alignment: Alignment.centerLeft,
                     child: Text(
-                      'Expand to load columns.',
-                      style: TextStyle(fontSize: 12, color: Colors.black54),
+                      isLoading
+                          ? 'Loading columns...'
+                          : 'Expand to load columns.',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.black54,
+                      ),
                     ),
                   ),
                 )

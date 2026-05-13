@@ -84,22 +84,56 @@ class AppTitleBar extends StatelessWidget {
 }
 
 class DbMenuBar extends StatelessWidget {
-  const DbMenuBar({super.key});
+  final VoidCallback onNewSql;
+  final VoidCallback onSelectSql;
+  final VoidCallback onSaveSql;
+
+  const DbMenuBar({
+    super.key,
+    required this.onNewSql,
+    required this.onSelectSql,
+    required this.onSaveSql,
+  });
 
   @override
   Widget build(BuildContext context) {
     return Container(
       height: 32,
       color: const Color(0xffeeeeee),
-      child: const Row(
+      child: Row(
         children: [
-          SizedBox(width: 12),
-          MenuItemLabel('File'),
-          MenuItemLabel('Edit'),
-          MenuItemLabel('Database'),
-          MenuItemLabel('SQL Editor'),
-          MenuItemLabel('Window'),
-          MenuItemLabel('Help'),
+          const SizedBox(width: 12),
+          const MenuItemLabel('File'),
+          const MenuItemLabel('Edit'),
+          const MenuItemLabel('Database'),
+          PopupMenuButton<String>(
+            tooltip: 'SQL Editor',
+            offset: const Offset(0, 28),
+            onSelected: (value) {
+              switch (value) {
+                case 'new':
+                  onNewSql();
+                  break;
+                case 'select':
+                  onSelectSql();
+                  break;
+                case 'save':
+                  onSaveSql();
+                  break;
+              }
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: 'new', child: _MenuCommand('New SQL')),
+              PopupMenuItem(
+                value: 'select',
+                child: _MenuCommand('Select SQL...'),
+              ),
+              PopupMenuItem(value: 'save', child: _MenuCommand('Save SQL')),
+            ],
+            child: const MenuItemLabel('SQL Editor'),
+          ),
+          const MenuItemLabel('Window'),
+          const MenuItemLabel('Help'),
         ],
       ),
     );
@@ -113,7 +147,6 @@ class DbToolbar extends StatelessWidget {
   final VoidCallback onNewSql;
   final VoidCallback? onExecute;
   final VoidCallback onStop;
-  final VoidCallback onSave;
   final VoidCallback onToggleNavigator;
   final VoidCallback onToggleOutput;
 
@@ -125,7 +158,6 @@ class DbToolbar extends StatelessWidget {
     required this.onNewSql,
     required this.onExecute,
     required this.onStop,
-    required this.onSave,
     required this.onToggleNavigator,
     required this.onToggleOutput,
   });
@@ -164,12 +196,6 @@ class DbToolbar extends StatelessWidget {
             label: 'Stop',
             tooltip: 'Stop Query (Esc)',
             onTap: onStop,
-          ),
-          ToolbarButton(
-            icon: Icons.save,
-            label: 'Save',
-            tooltip: 'Save SQL File (Ctrl+S)',
-            onTap: onSave,
           ),
           const Spacer(),
           ToolbarButton(
@@ -471,6 +497,17 @@ class MenuItemLabel extends StatelessWidget {
         style: const TextStyle(fontSize: 13, color: Colors.black87),
       ),
     );
+  }
+}
+
+class _MenuCommand extends StatelessWidget {
+  final String text;
+
+  const _MenuCommand(this.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(text, style: const TextStyle(fontSize: 13));
   }
 }
 
