@@ -3,6 +3,9 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_code_editor/flutter_code_editor.dart';
+import 'package:flutter_highlight/themes/github.dart';
+import 'package:highlight/languages/sql.dart';
 import 'package:panes/panes.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:postgres/postgres.dart';
@@ -14,8 +17,13 @@ import 'widgets/db_viewer_widgets.dart';
 
 class MyHomePage extends StatefulWidget {
   final String title;
+  final bool nativeWindowChrome;
 
-  const MyHomePage({super.key, required this.title});
+  const MyHomePage({
+    super.key,
+    required this.title,
+    this.nativeWindowChrome = true,
+  });
 
   @override
   State<MyHomePage> createState() => _MyHomePageState();
@@ -29,7 +37,9 @@ class _MyHomePageState extends State<MyHomePage> {
   final PostgresConnectionStore _connectionStore = PostgresConnectionStore();
 
   PostgresDatabase? _database;
+  PostgresDatabase? _executingDatabase;
   bool _isExecuting = false;
+  bool _cancelRequested = false;
   bool _isConnecting = false;
   bool _showAllSqlScripts = false;
   double _resultPanelHeight = 260;
@@ -43,6 +53,14 @@ class _MyHomePageState extends State<MyHomePage> {
   List<String> _logs = [];
   List<String> _columns = [];
   List<List<dynamic>> _rows = [];
+  PostgresDatabase? _resultDatabase;
+  String? _resultSchema;
+  String? _resultTable;
+  List<DatabaseColumn> _resultColumnMetadata = [];
+  final Map<String, _ColumnFilter> _resultColumnFilters = {};
+  final Map<int, Map<int, String>> _resultPendingChanges = {};
+  String? _resultSortColumn;
+  bool _resultSortAscending = true;
 
   final List<_OpenConnection> _connections = [];
   final List<_SqlScriptTab> _sqlTabs = [];
@@ -414,9 +432,11 @@ class _MyHomePageState extends State<MyHomePage> {
 
     setState(() {
       _isExecuting = true;
+      _executingDatabase = database;
+      _cancelRequested = false;
       _activeSqlTab?.error = null;
       _logs.add('[INFO] Executing SQL...');
-      _logs.add('[SQL] ${sql.replaceAll('\n', ' ')}');
+      _logs.add('[SQL] ${_sqlSummary(sql)}');
     });
 
     try {
@@ -445,12 +465,27 @@ class _MyHomePageState extends State<MyHomePage> {
 
       if (!_isExecuting) return null;
 
+      final resultContext = updateSqlResults
+          ? await _resolveSqlResultContext(sql, database, result)
+          : null;
+      if (!_isExecuting) return null;
+
       setState(() {
         if (updateSqlResults) {
           _columns = result.columns;
           _rows = result.rows;
+          _resultDatabase = database;
+          _resultSchema = resultContext?.schema;
+          _resultTable = resultContext?.table;
+          _resultColumnMetadata = resultContext?.columns ?? const [];
+          _resultColumnFilters.clear();
+          _resultPendingChanges.clear();
+          _resultSortColumn = null;
+          _resultSortAscending = true;
         }
         _isExecuting = false;
+        _executingDatabase = null;
+        _cancelRequested = false;
         _logs.add('[INFO] Query executed successfully');
         _logs.add(
           '[INFO] ${result.rows.length} rows fetched, ${result.affectedRows} affected in ${result.elapsed.inMilliseconds} ms',
@@ -470,6 +505,9 @@ class _MyHomePageState extends State<MyHomePage> {
 
       setState(() {
         _isExecuting = false;
+        _executingDatabase = null;
+        final wasCancelled = _cancelRequested;
+        _cancelRequested = false;
         if (updateSqlResults && error is PostgresQueryException) {
           _activeSqlTab?.error = _SqlEditorError.fromPostgresException(
             editorText ?? sql,
@@ -483,11 +521,93 @@ class _MyHomePageState extends State<MyHomePage> {
             editorOffset: editorOffset,
           );
         }
-        _logs.add('[ERROR] Query failed: $error');
+        _logs.add(
+          wasCancelled
+              ? '[INFO] Query cancelled'
+              : '[ERROR] Query failed: $error',
+        );
       });
       _showResultTab('Messages');
       return null;
     }
+  }
+
+  Future<_SqlResultContext?> _resolveSqlResultContext(
+    String sql,
+    PostgresDatabase database,
+    PostgresQueryResult result,
+  ) async {
+    if (result.columns.isEmpty || result.rows.isEmpty) return null;
+    final reference = _singleTableSelectReference(sql);
+    if (reference == null) return null;
+
+    try {
+      final table = await database.loadTableColumns(
+        reference.schema,
+        reference.table,
+      );
+      return _SqlResultContext(
+        schema: reference.schema,
+        table: reference.table,
+        columns: table.columns,
+      );
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _logs.add(
+            '[WARN] Result editing metadata unavailable for '
+            '${reference.schema}.${reference.table}: $error',
+          );
+        });
+      }
+      return null;
+    }
+  }
+
+  _EditableResultReference? _singleTableSelectReference(String sql) {
+    final sanitized = sql
+        .replaceAll(RegExp(r'--[^\r\n]*'), ' ')
+        .replaceAll(RegExp(r'/\*[\s\S]*?\*/'), ' ')
+        .trim();
+    if (!RegExp(r'^select\b', caseSensitive: false).hasMatch(sanitized) ||
+        RegExp(
+          r'\b(join|union|intersect|except|group\s+by|having)\b',
+          caseSensitive: false,
+        ).hasMatch(sanitized)) {
+      return null;
+    }
+
+    final matches = RegExp(
+      r'\bfrom\s+((?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*))?)',
+      caseSensitive: false,
+    ).allMatches(sanitized).toList();
+    if (matches.length != 1) return null;
+
+    final parts = matches.single.group(1)!.split('.');
+    final names = [for (final part in parts) _unquoteIdentifier(part.trim())];
+    if (names.length == 2) {
+      return _EditableResultReference(schema: names[0], table: names[1]);
+    }
+    final schema = _activeSchema != '-' ? _activeSchema : 'public';
+    return _EditableResultReference(schema: schema, table: names.single);
+  }
+
+  String _unquoteIdentifier(String identifier) {
+    if (identifier.length >= 2 &&
+        identifier.startsWith('"') &&
+        identifier.endsWith('"')) {
+      return identifier
+          .substring(1, identifier.length - 1)
+          .replaceAll('""', '"');
+    }
+    return identifier;
+  }
+
+  String _sqlSummary(String sql) {
+    final keyword =
+        RegExp(r'^\s*([A-Za-z]+)').firstMatch(sql)?.group(1)?.toUpperCase() ??
+        'SQL';
+    return '$keyword statement (${sql.length} characters)';
   }
 
   bool _containsMutatingSql(String sql) {
@@ -608,11 +728,34 @@ class _MyHomePageState extends State<MyHomePage> {
       return;
     }
 
+    unawaited(_cancelRunningQuery());
+  }
+
+  Future<void> _cancelRunningQuery() async {
+    final database = _executingDatabase;
+    if (database == null || _cancelRequested) return;
     setState(() {
-      _isExecuting = false;
-      _logs.add('[WARN] Query execution stopped by user.');
+      _cancelRequested = true;
+      _logs.add('[INFO] Requesting PostgreSQL query cancellation...');
     });
     _showResultTab('Messages');
+
+    try {
+      final cancelled = await database.cancelCurrentQuery();
+      if (!mounted) return;
+      if (!cancelled) {
+        setState(() {
+          _cancelRequested = false;
+          _logs.add('[WARN] PostgreSQL reported no cancellable query.');
+        });
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _cancelRequested = false;
+        _logs.add('[ERROR] Query cancellation failed: $error');
+      });
+    }
   }
 
   Future<void> _initializeSqlEditor() async {
@@ -1353,25 +1496,31 @@ class _MyHomePageState extends State<MyHomePage> {
     });
 
     try {
-      var affectedRows = 0;
+      final updates = <PostgresRowUpdate>[];
       for (final rowEntry in tab.pendingChanges.entries) {
         final originalRow = tab.rows[rowEntry.key];
         final changes = <String, Object?>{};
+        final originalValues = <String, Object?>{};
         for (final cell in rowEntry.value.entries) {
           final column = tab.columns[cell.key];
           changes[column.name] = _typedCellValue(column, cell.value);
+          originalValues[column.name] = originalRow[cell.key];
         }
         final primaryKey = <String, Object?>{
           for (final column in tab.primaryKeyColumns)
             column.name: originalRow[tab.resultColumns.indexOf(column.name)],
         };
-        affectedRows += await tab.database.updateRow(
-          schema: tab.schema,
-          table: tab.table,
-          changes: changes,
-          primaryKey: primaryKey,
+        updates.add(
+          PostgresRowUpdate(
+            schema: tab.schema,
+            table: tab.table,
+            changes: changes,
+            primaryKey: primaryKey,
+            originalValues: originalValues,
+          ),
         );
       }
+      final affectedRows = await tab.database.updateRows(updates);
 
       if (!mounted) return;
       setState(() {
@@ -1402,6 +1551,277 @@ class _MyHomePageState extends State<MyHomePage> {
       return value.toLowerCase() == 'true';
     }
     return value;
+  }
+
+  DatabaseColumn _resultColumn(String columnName, int columnIndex) {
+    return _resultColumnMetadata
+            .where((column) => column.name == columnName)
+            .firstOrNull ??
+        _inferResultColumn(columnName, columnIndex);
+  }
+
+  DatabaseColumn _inferResultColumn(String name, int columnIndex) {
+    Object? sample;
+    for (final row in _rows) {
+      if (columnIndex < row.length && row[columnIndex] != null) {
+        sample = row[columnIndex];
+        break;
+      }
+    }
+    final type = switch (sample) {
+      int _ => 'integer',
+      double _ || num _ => 'numeric',
+      bool _ => 'boolean',
+      DateTime _ => 'timestamp',
+      _ => 'text',
+    };
+    return DatabaseColumn(name: name, dataType: type, nullable: true);
+  }
+
+  Future<void> _filterSqlResultColumn(String columnName) async {
+    final columnIndex = _columns.indexOf(columnName);
+    if (columnIndex == -1) return;
+    final filter = await showDialog<_ColumnFilter>(
+      context: context,
+      builder: (context) => _ColumnFilterDialog(
+        column: _resultColumn(columnName, columnIndex),
+        initialFilter: _resultColumnFilters[columnName],
+      ),
+    );
+    if (!mounted || filter == null) return;
+    setState(() {
+      if (filter.remove) {
+        _resultColumnFilters.remove(columnName);
+      } else {
+        _resultColumnFilters[columnName] = filter;
+      }
+    });
+  }
+
+  void _sortSqlResult(String columnName) {
+    setState(() {
+      if (_resultSortColumn == columnName) {
+        _resultSortAscending = !_resultSortAscending;
+      } else {
+        _resultSortColumn = columnName;
+        _resultSortAscending = true;
+      }
+    });
+  }
+
+  List<({int sourceIndex, List<dynamic> row})> get _visibleSqlResultRows {
+    final visible = <({int sourceIndex, List<dynamic> row})>[];
+    for (final (index, row) in _rows.indexed) {
+      if (_matchesResultFilters(row)) {
+        visible.add((sourceIndex: index, row: row));
+      }
+    }
+    final sortColumn = _resultSortColumn;
+    if (sortColumn != null) {
+      final columnIndex = _columns.indexOf(sortColumn);
+      visible.sort((left, right) {
+        final comparison = _compareResultValues(
+          left.row.elementAtOrNull(columnIndex),
+          right.row.elementAtOrNull(columnIndex),
+        );
+        return _resultSortAscending ? comparison : -comparison;
+      });
+    }
+    return visible;
+  }
+
+  bool _matchesResultFilters(List<dynamic> row) {
+    for (final entry in _resultColumnFilters.entries) {
+      final columnIndex = _columns.indexOf(entry.key);
+      if (columnIndex == -1 ||
+          !_matchesResultFilter(
+            row.elementAtOrNull(columnIndex),
+            entry.value,
+          )) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool _matchesResultFilter(Object? value, _ColumnFilter filter) {
+    if (filter.operator == 'is-null') return value == null;
+    if (filter.operator == 'is-not-null') return value != null;
+    if (value == null) return false;
+
+    final actual = value.toString();
+    final expected = filter.value;
+    switch (filter.operator) {
+      case 'contains':
+        return actual.toLowerCase().contains(expected.toLowerCase());
+      case 'starts-with':
+        return actual.toLowerCase().startsWith(expected.toLowerCase());
+      case 'ends-with':
+        return actual.toLowerCase().endsWith(expected.toLowerCase());
+      case 'not-equals':
+        return _compareFilterValues(value, expected, filter.kind) != 0;
+      case 'greater-than':
+        return _compareFilterValues(value, expected, filter.kind) > 0;
+      case 'greater-or-equal':
+        return _compareFilterValues(value, expected, filter.kind) >= 0;
+      case 'less-than':
+        return _compareFilterValues(value, expected, filter.kind) < 0;
+      case 'less-or-equal':
+        return _compareFilterValues(value, expected, filter.kind) <= 0;
+      case 'equals':
+      default:
+        return _compareFilterValues(value, expected, filter.kind) == 0;
+    }
+  }
+
+  int _compareFilterValues(
+    Object value,
+    String expected,
+    _ColumnFilterKind kind,
+  ) {
+    switch (kind) {
+      case _ColumnFilterKind.number:
+        return (num.tryParse(value.toString()) ?? 0).compareTo(
+          num.tryParse(expected) ?? 0,
+        );
+      case _ColumnFilterKind.boolean:
+        return value.toString().toLowerCase().compareTo(expected.toLowerCase());
+      case _ColumnFilterKind.dateTime:
+        final actualDate = value is DateTime
+            ? value
+            : DateTime.tryParse(value.toString());
+        final expectedDate = DateTime.tryParse(expected);
+        if (actualDate != null && expectedDate != null) {
+          return actualDate.compareTo(expectedDate);
+        }
+        return value.toString().compareTo(expected);
+      case _ColumnFilterKind.text:
+        return value.toString().toLowerCase().compareTo(expected.toLowerCase());
+    }
+  }
+
+  int _compareResultValues(Object? left, Object? right) {
+    if (left == null && right == null) return 0;
+    if (left == null) return -1;
+    if (right == null) return 1;
+    if (left is num && right is num) return left.compareTo(right);
+    if (left is DateTime && right is DateTime) return left.compareTo(right);
+    return left.toString().toLowerCase().compareTo(
+      right.toString().toLowerCase(),
+    );
+  }
+
+  bool get _canEditSqlResult {
+    final primaryKeys = _resultColumnMetadata
+        .where((column) => column.primaryKey)
+        .toList();
+    return _resultDatabase != null &&
+        _resultSchema != null &&
+        _resultTable != null &&
+        primaryKeys.isNotEmpty &&
+        primaryKeys.every((column) => _columns.contains(column.name)) &&
+        _columns.toSet().length == _columns.length;
+  }
+
+  bool _canEditSqlResultColumn(int columnIndex) {
+    if (!_canEditSqlResult || columnIndex >= _columns.length) return false;
+    final name = _columns[columnIndex];
+    return _resultColumnMetadata.any((column) => column.name == name);
+  }
+
+  void _editSqlResultCell(int sourceRow, int columnIndex, String value) {
+    if (!_canEditSqlResultColumn(columnIndex)) return;
+    final original = _rows[sourceRow][columnIndex]?.toString() ?? '';
+    setState(() {
+      if (value == original) {
+        _resultPendingChanges[sourceRow]?.remove(columnIndex);
+        if (_resultPendingChanges[sourceRow]?.isEmpty ?? false) {
+          _resultPendingChanges.remove(sourceRow);
+        }
+      } else {
+        _resultPendingChanges.putIfAbsent(
+          sourceRow,
+          () => <int, String>{},
+        )[columnIndex] = value;
+      }
+    });
+  }
+
+  Future<void> _saveSqlResultChanges() async {
+    final database = _resultDatabase;
+    final schema = _resultSchema;
+    final table = _resultTable;
+    if (!_canEditSqlResult ||
+        database == null ||
+        schema == null ||
+        table == null ||
+        _resultPendingChanges.isEmpty) {
+      return;
+    }
+    if (database.config.writeProtected &&
+        !await _confirmProtectedWrite(database.config)) {
+      return;
+    }
+
+    setState(() {
+      _isExecuting = true;
+      _logs.add(
+        '[INFO] Saving ${_resultPendingChanges.length} edited result rows',
+      );
+    });
+    try {
+      final primaryKeys = _resultColumnMetadata
+          .where((column) => column.primaryKey)
+          .toList();
+      final updates = <PostgresRowUpdate>[];
+      for (final rowEntry in _resultPendingChanges.entries) {
+        final originalRow = _rows[rowEntry.key];
+        final changes = <String, Object?>{};
+        final originalValues = <String, Object?>{};
+        for (final cell in rowEntry.value.entries) {
+          final columnName = _columns[cell.key];
+          final column = _resultColumnMetadata.firstWhere(
+            (item) => item.name == columnName,
+          );
+          changes[columnName] = _typedCellValue(column, cell.value);
+          originalValues[columnName] = originalRow[cell.key];
+        }
+        updates.add(
+          PostgresRowUpdate(
+            schema: schema,
+            table: table,
+            changes: changes,
+            primaryKey: {
+              for (final column in primaryKeys)
+                column.name: originalRow[_columns.indexOf(column.name)],
+            },
+            originalValues: originalValues,
+          ),
+        );
+      }
+      final affected = await database.updateRows(updates);
+      if (!mounted) return;
+      setState(() {
+        for (final rowEntry in _resultPendingChanges.entries) {
+          for (final cell in rowEntry.value.entries) {
+            final column = _resultColumnMetadata.firstWhere(
+              (item) => item.name == _columns[cell.key],
+            );
+            _rows[rowEntry.key][cell.key] = _typedCellValue(column, cell.value);
+          }
+        }
+        _resultPendingChanges.clear();
+        _isExecuting = false;
+        _logs.add('[INFO] Saved $affected updated result rows');
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isExecuting = false;
+        _logs.add('[ERROR] Failed to save result changes: $error');
+      });
+      _showResultTab('Messages');
+    }
   }
 
   Future<void> _loadTableTabData(_OpenTableTab tab) async {
@@ -1834,11 +2254,6 @@ class _MyHomePageState extends State<MyHomePage> {
     _activeResultTab.value = tab;
   }
 
-  String _lineNumberText(String text) {
-    final lineCount = text.isEmpty ? 1 : '\n'.allMatches(text).length + 1;
-    return [for (var line = 1; line <= lineCount; line++) '$line'].join('\n');
-  }
-
   _OpenTableTab? get _activeTableTab {
     final tableIndex = _activeCenterTab - _sqlTabs.length;
     if (tableIndex < 0 || tableIndex >= _openTableTabs.length) {
@@ -1962,10 +2377,36 @@ class _MyHomePageState extends State<MyHomePage> {
     return ValueListenableBuilder<String>(
       valueListenable: _activeResultTab,
       builder: (context, activeTab, child) {
+        final visibleRows = _visibleSqlResultRows;
         return IndexedStack(
           index: _resultTabIndex(activeTab),
           children: [
-            ResultGrid(columns: _columns, rows: _rows),
+            ResultGrid(
+              columns: _columns,
+              rows: [for (final item in visibleRows) item.row],
+              sortColumn: _resultSortColumn,
+              sortAscending: _resultSortAscending,
+              filteredColumns: _resultColumnFilters.keys.toSet(),
+              onSortColumn: _isExecuting
+                  ? null
+                  : (column) async => _sortSqlResult(column),
+              onFilterColumn: _isExecuting ? null : _filterSqlResultColumn,
+              editable: _canEditSqlResult && !_isExecuting,
+              columnEditable: _canEditSqlResultColumn,
+              cellValue: (row, column) {
+                final sourceRow = visibleRows[row].sourceIndex;
+                return _resultPendingChanges[sourceRow]?[column] ??
+                    (_rows[sourceRow][column]?.toString() ?? '');
+              },
+              cellEdited: (row, column) {
+                final sourceRow = visibleRows[row].sourceIndex;
+                return _resultPendingChanges[sourceRow]?.containsKey(column) ??
+                    false;
+              },
+              onCellChanged: (row, column, value) {
+                _editSqlResultCell(visibleRows[row].sourceIndex, column, value);
+              },
+            ),
             MessagesView(logs: _logs),
           ],
         );
@@ -1998,7 +2439,11 @@ class _MyHomePageState extends State<MyHomePage> {
           backgroundColor: const Color(0xfff3f3f3),
           body: Column(
             children: [
-              AppTitleBar(connectionName: _activeConnection, status: _status),
+              AppTitleBar(
+                connectionName: _activeConnection,
+                status: _status,
+                nativeWindowChrome: widget.nativeWindowChrome,
+              ),
               DbMenuBar(
                 onNewConnection: _newConnection,
                 onNewSql: _newSqlScript,
@@ -2249,11 +2694,14 @@ class _MyHomePageState extends State<MyHomePage> {
           child: LayoutBuilder(
             builder: (context, constraints) {
               final maxResultHeight = (constraints.maxHeight - 140).clamp(
-                120.0,
+                0.0,
                 constraints.maxHeight,
               );
+              final minResultHeight = maxResultHeight < 120
+                  ? maxResultHeight
+                  : 120.0;
               final resultHeight = _resultPanelHeight.clamp(
-                120.0,
+                minResultHeight,
                 maxResultHeight,
               );
               return Column(
@@ -2267,7 +2715,7 @@ class _MyHomePageState extends State<MyHomePage> {
                         setState(() {
                           _resultPanelHeight =
                               (_resultPanelHeight - details.delta.dy).clamp(
-                                120.0,
+                                minResultHeight,
                                 maxResultHeight,
                               );
                         });
@@ -2333,9 +2781,36 @@ class _MyHomePageState extends State<MyHomePage> {
                 onTap: () => _selectResultTab('Messages'),
               ),
               const Spacer(),
+              if (activeTab == 'Data' && _resultColumnFilters.isNotEmpty)
+                IconButton(
+                  tooltip: 'Clear all filters',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _isExecuting
+                      ? null
+                      : () => setState(_resultColumnFilters.clear),
+                  icon: const Icon(Icons.filter_alt_off_outlined, size: 18),
+                ),
+              if (activeTab == 'Data' && _resultPendingChanges.isNotEmpty) ...[
+                IconButton(
+                  tooltip: 'Cancel data changes',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _isExecuting
+                      ? null
+                      : () => setState(_resultPendingChanges.clear),
+                  icon: const Icon(Icons.undo, size: 18),
+                ),
+                IconButton(
+                  tooltip: 'Save data changes',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _isExecuting
+                      ? null
+                      : () => unawaited(_saveSqlResultChanges()),
+                  icon: const Icon(Icons.save_outlined, size: 18),
+                ),
+              ],
               Text(
                 activeTab == 'Data'
-                    ? '${_rows.length} rows'
+                    ? '${_visibleSqlResultRows.length} / ${_rows.length} rows'
                     : '${_logs.length} messages',
                 style: const TextStyle(fontSize: 12, color: Colors.black54),
               ),
@@ -2430,44 +2905,12 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
           ),
           Expanded(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                ValueListenableBuilder<TextEditingValue>(
-                  valueListenable: sqlTab.controller,
-                  builder: (context, value, child) {
-                    return Container(
-                      width: 52,
-                      color: const Color(0xfff0f3f5),
-                      padding: const EdgeInsets.only(top: 12, right: 8),
-                      alignment: Alignment.topRight,
-                      child: Text(
-                        _lineNumberText(value.text),
-                        textAlign: TextAlign.right,
-                        style: const TextStyle(
-                          color: Color(0xff7a858d),
-                          fontFamily: 'Consolas',
-                          fontSize: 13,
-                          height: 1.5,
-                        ),
-                      ),
-                    );
-                  },
-                ),
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: _SqlAutocompleteEditor(
-                      controller: sqlTab.controller,
-                      focusNode: sqlTab.focusNode,
-                      error: sqlTab.error,
-                      optionsBuilder: (value) =>
-                          _sqlAutocompleteOptions(sqlTab, value),
-                      onSelected: _insertAutocompleteOption,
-                    ),
-                  ),
-                ),
-              ],
+            child: _SqlCodeEditor(
+              controller: sqlTab.controller,
+              focusNode: sqlTab.focusNode,
+              error: sqlTab.error,
+              optionsBuilder: (value) => _sqlAutocompleteOptions(sqlTab, value),
+              onSelected: _insertAutocompleteOption,
             ),
           ),
         ],
@@ -2636,6 +3079,25 @@ class _MyHomePageState extends State<MyHomePage> {
       ),
     );
   }
+}
+
+class _EditableResultReference {
+  final String schema;
+  final String table;
+
+  const _EditableResultReference({required this.schema, required this.table});
+}
+
+class _SqlResultContext {
+  final String schema;
+  final String table;
+  final List<DatabaseColumn> columns;
+
+  const _SqlResultContext({
+    required this.schema,
+    required this.table,
+    required this.columns,
+  });
 }
 
 class _OpenTableTab {
@@ -3000,7 +3462,7 @@ class _SqlScriptTab {
   String title;
   File? file;
   String connectionKey;
-  final TextEditingController controller;
+  final _SqlCodeController controller;
   final FocusNode focusNode = FocusNode();
   _SqlEditorError? error;
 
@@ -3009,7 +3471,9 @@ class _SqlScriptTab {
     this.file,
     this.connectionKey = _MyHomePageState._globalScriptConnectionKey,
     required String text,
-  }) : controller = TextEditingController(text: text);
+  }) : controller = _SqlCodeController(text: text) {
+    controller.popupController.enabled = false;
+  }
 
   Future<void> save() async {
     final file = this.file;
@@ -3024,6 +3488,21 @@ class _SqlScriptTab {
   void dispose() {
     controller.dispose();
     focusNode.dispose();
+  }
+}
+
+class _SqlCodeController extends CodeController {
+  KeyEventResult Function(KeyEvent event)? completionKeyHandler;
+
+  _SqlCodeController({required String text}) : super(text: text, language: sql);
+
+  @override
+  KeyEventResult onKey(KeyEvent event) {
+    final completionResult = completionKeyHandler?.call(event);
+    if (completionResult == KeyEventResult.handled) {
+      return KeyEventResult.handled;
+    }
+    return super.onKey(event);
   }
 }
 
@@ -3107,14 +3586,14 @@ class _SqlTableReference {
   const _SqlTableReference({required this.schema, required this.table});
 }
 
-class _SqlAutocompleteEditor extends StatefulWidget {
-  final TextEditingController controller;
+class _SqlCodeEditor extends StatefulWidget {
+  final _SqlCodeController controller;
   final FocusNode focusNode;
   final _SqlEditorError? error;
   final List<_SqlCompletion> Function(TextEditingValue value) optionsBuilder;
   final ValueChanged<_SqlCompletion> onSelected;
 
-  const _SqlAutocompleteEditor({
+  const _SqlCodeEditor({
     required this.controller,
     required this.focusNode,
     required this.error,
@@ -3123,10 +3602,10 @@ class _SqlAutocompleteEditor extends StatefulWidget {
   });
 
   @override
-  State<_SqlAutocompleteEditor> createState() => _SqlAutocompleteEditorState();
+  State<_SqlCodeEditor> createState() => _SqlCodeEditorState();
 }
 
-class _SqlAutocompleteEditorState extends State<_SqlAutocompleteEditor> {
+class _SqlCodeEditorState extends State<_SqlCodeEditor> {
   static const _textStyle = TextStyle(
     fontFamily: 'Consolas',
     fontSize: 14,
@@ -3142,14 +3621,17 @@ class _SqlAutocompleteEditorState extends State<_SqlAutocompleteEditor> {
     super.initState();
     widget.controller.addListener(_updateOptions);
     widget.focusNode.addListener(_handleFocusChange);
+    widget.controller.completionKeyHandler = _handleKeyEvent;
   }
 
   @override
-  void didUpdateWidget(covariant _SqlAutocompleteEditor oldWidget) {
+  void didUpdateWidget(covariant _SqlCodeEditor oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.completionKeyHandler = null;
       oldWidget.controller.removeListener(_updateOptions);
       widget.controller.addListener(_updateOptions);
+      widget.controller.completionKeyHandler = _handleKeyEvent;
       _options = const [];
       _highlightedIndex = -1;
     }
@@ -3161,6 +3643,7 @@ class _SqlAutocompleteEditorState extends State<_SqlAutocompleteEditor> {
 
   @override
   void dispose() {
+    widget.controller.completionKeyHandler = null;
     widget.controller.removeListener(_updateOptions);
     widget.focusNode.removeListener(_handleFocusChange);
     super.dispose();
@@ -3190,7 +3673,7 @@ class _SqlAutocompleteEditorState extends State<_SqlAutocompleteEditor> {
     });
   }
 
-  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+  KeyEventResult _handleKeyEvent(KeyEvent event) {
     if (event is! KeyDownEvent || _options.isEmpty) {
       return KeyEventResult.ignored;
     }
@@ -3281,141 +3764,152 @@ class _SqlAutocompleteEditorState extends State<_SqlAutocompleteEditor> {
             ? null
             : _textOffset(widget.error!.offset, constraints.maxWidth);
 
-        return Focus(
-          onKeyEvent: _handleKeyEvent,
-          child: Stack(
-            clipBehavior: Clip.hardEdge,
-            children: [
-              Positioned.fill(
-                child: TextField(
+        return Stack(
+          clipBehavior: Clip.hardEdge,
+          children: [
+            Positioned.fill(
+              child: CodeTheme(
+                data: CodeThemeData(styles: githubTheme),
+                child: CodeField(
                   controller: widget.controller,
                   focusNode: widget.focusNode,
-                  maxLines: null,
                   expands: true,
-                  textAlignVertical: TextAlignVertical.top,
-                  style: _textStyle,
-                  decoration: const InputDecoration(
-                    border: InputBorder.none,
-                    hintText:
-                        'Write SQL here. Select a statement or run the whole script.',
+                  wrap: false,
+                  background: Colors.white,
+                  cursorColor: const Color(0xff1f6feb),
+                  textStyle: _textStyle,
+                  padding: const EdgeInsets.fromLTRB(10, 10, 12, 36),
+                  lineNumberBuilder: (line, style) {
+                    final isErrorLine =
+                        widget.error != null && line == widget.error!.line;
+                    return TextSpan(
+                      text: '$line',
+                      style: (style ?? const TextStyle()).copyWith(
+                        color: isErrorLine
+                            ? const Color(0xffb42318)
+                            : const Color(0xff7a858d),
+                        fontWeight: isErrorLine
+                            ? FontWeight.w700
+                            : FontWeight.normal,
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+            if (_options.isNotEmpty)
+              Positioned(
+                left: popupLeft,
+                top: popupTop,
+                width: popupWidth,
+                child: Material(
+                  elevation: 6,
+                  color: Colors.white,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 240),
+                    child: ListView.builder(
+                      padding: EdgeInsets.zero,
+                      shrinkWrap: true,
+                      itemCount: _options.length,
+                      itemBuilder: (context, index) {
+                        final option = _options[index];
+                        final highlighted = index == _highlightedIndex;
+                        return GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTapDown: (_) => _select(option),
+                          child: Container(
+                            height: 40,
+                            color: highlighted
+                                ? const Color(0xffd9eaf7)
+                                : Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.code, size: 15),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    option.label,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontFamily: 'Consolas',
+                                      fontSize: 13,
+                                      fontWeight: highlighted
+                                          ? FontWeight.w600
+                                          : FontWeight.normal,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Flexible(
+                                  child: Text(
+                                    option.detail,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      color: Colors.black54,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
                   ),
                 ),
               ),
-              if (_options.isNotEmpty)
-                Positioned(
-                  left: popupLeft,
-                  top: popupTop,
-                  width: popupWidth,
-                  child: Material(
-                    elevation: 6,
-                    color: Colors.white,
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxHeight: 240),
-                      child: ListView.builder(
-                        padding: EdgeInsets.zero,
-                        shrinkWrap: true,
-                        itemCount: _options.length,
-                        itemBuilder: (context, index) {
-                          final option = _options[index];
-                          final highlighted = index == _highlightedIndex;
-                          return InkWell(
-                            onTap: () => _select(option),
-                            child: Container(
-                              height: 40,
-                              color: highlighted
-                                  ? const Color(0xffd9eaf7)
-                                  : Colors.white,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                              ),
-                              child: Row(
-                                children: [
-                                  const Icon(Icons.code, size: 15),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      option.label,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        fontFamily: 'Consolas',
-                                        fontSize: 13,
-                                        fontWeight: highlighted
-                                            ? FontWeight.w600
-                                            : FontWeight.normal,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Flexible(
-                                    child: Text(
-                                      option.detail,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        fontSize: 11,
-                                        color: Colors.black54,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                  ),
-                ),
-              if (errorOffset != null)
-                Positioned(
-                  left: errorOffset.dx,
-                  top: errorOffset.dy + 20,
-                  child: Tooltip(
-                    message: widget.error!.message,
-                    child: Container(
-                      width: 14,
-                      height: 3,
-                      decoration: BoxDecoration(
-                        color: const Color(0xffd13438),
-                        borderRadius: BorderRadius.circular(2),
-                      ),
-                    ),
-                  ),
-                ),
-              if (widget.error != null)
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  bottom: 0,
+            if (errorOffset != null)
+              Positioned(
+                left: errorOffset.dx,
+                top: errorOffset.dy + 20,
+                child: Tooltip(
+                  message: widget.error!.message,
                   child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 7,
+                    width: 14,
+                    height: 3,
+                    decoration: BoxDecoration(
+                      color: const Color(0xffd13438),
+                      borderRadius: BorderRadius.circular(2),
                     ),
-                    color: const Color(0xffffeeee),
-                    child: Row(
-                      children: [
-                        const Icon(
-                          Icons.error_outline,
-                          size: 16,
-                          color: Color(0xffb42318),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            'Line ${widget.error!.line}, column ${widget.error!.column}: ${widget.error!.message}',
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: Color(0xff8a1c1c),
-                              fontSize: 12,
-                            ),
+                  ),
+                ),
+              ),
+            if (widget.error != null)
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 7,
+                  ),
+                  color: const Color(0xffffeeee),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.error_outline,
+                        size: 16,
+                        color: Color(0xffb42318),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Line ${widget.error!.line}, column ${widget.error!.column}: ${widget.error!.message}',
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Color(0xff8a1c1c),
+                            fontSize: 12,
                           ),
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
                 ),
-            ],
-          ),
+              ),
+          ],
         );
       },
     );

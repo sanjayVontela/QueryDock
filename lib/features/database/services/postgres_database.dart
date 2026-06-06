@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:postgres/postgres.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -30,6 +31,28 @@ class PostgresConnectionConfig {
 
   String get displayName => name.trim().isEmpty ? endpointName : name.trim();
 
+  PostgresConnectionConfig copyWith({
+    String? name,
+    String? host,
+    int? port,
+    String? database,
+    String? username,
+    String? password,
+    SslMode? sslMode,
+    bool? writeProtected,
+  }) {
+    return PostgresConnectionConfig(
+      name: name ?? this.name,
+      host: host ?? this.host,
+      port: port ?? this.port,
+      database: database ?? this.database,
+      username: username ?? this.username,
+      password: password ?? this.password,
+      sslMode: sslMode ?? this.sslMode,
+      writeProtected: writeProtected ?? this.writeProtected,
+    );
+  }
+
   Map<String, Object?> toStoredJson() {
     return {
       'name': name,
@@ -37,7 +60,6 @@ class PostgresConnectionConfig {
       'port': port,
       'database': database,
       'username': username,
-      'password': password,
       'sslMode': sslMode.name,
       'writeProtected': writeProtected,
     };
@@ -77,15 +99,33 @@ class PostgresConnectionConfig {
 
 class PostgresConnectionStore {
   static const _storageKey = 'postgres.connection.profiles';
+  final ConnectionSecretStore _secretStore;
+
+  PostgresConnectionStore({ConnectionSecretStore? secretStore})
+    : _secretStore = secretStore ?? const SecureConnectionSecretStore();
 
   Future<List<PostgresConnectionConfig>> load() async {
     final preferences = await SharedPreferences.getInstance();
     final encodedProfiles = preferences.getStringList(_storageKey) ?? [];
+    final profiles = <PostgresConnectionConfig>[];
+    var migratedPlaintextPassword = false;
 
-    return [
-      for (final encodedProfile in encodedProfiles)
-        ?_decodeProfile(encodedProfile),
-    ];
+    for (final encodedProfile in encodedProfiles) {
+      final decoded = _decodeProfile(encodedProfile);
+      if (decoded == null) continue;
+      final storedPassword = await _secretStore.read(decoded.endpointName);
+      final password = storedPassword ?? decoded.password;
+      if (storedPassword == null && decoded.password.isNotEmpty) {
+        await _secretStore.write(decoded.endpointName, decoded.password);
+        migratedPlaintextPassword = true;
+      }
+      profiles.add(decoded.copyWith(password: password));
+    }
+
+    if (migratedPlaintextPassword) {
+      await _writeProfiles(preferences, profiles);
+    }
+    return profiles;
   }
 
   Future<void> save(PostgresConnectionConfig config) async {
@@ -96,11 +136,8 @@ class PostgresConnectionStore {
       for (final profile in existingProfiles)
         if (profile.endpointName != config.endpointName) profile,
     ];
-
-    await preferences.setStringList(_storageKey, [
-      for (final profile in profiles.take(10))
-        jsonEncode(profile.toStoredJson()),
-    ]);
+    await _secretStore.write(config.endpointName, config.password);
+    await _writeProfiles(preferences, profiles.take(10));
   }
 
   Future<void> delete(PostgresConnectionConfig config) async {
@@ -110,8 +147,15 @@ class PostgresConnectionStore {
       for (final profile in existingProfiles)
         if (profile.endpointName != config.endpointName) profile,
     ];
+    await _secretStore.delete(config.endpointName);
+    await _writeProfiles(preferences, profiles);
+  }
 
-    await preferences.setStringList(_storageKey, [
+  Future<void> _writeProfiles(
+    SharedPreferences preferences,
+    Iterable<PostgresConnectionConfig> profiles,
+  ) {
+    return preferences.setStringList(_storageKey, [
       for (final profile in profiles) jsonEncode(profile.toStoredJson()),
     ]);
   }
@@ -127,6 +171,38 @@ class PostgresConnectionStore {
     }
 
     return null;
+  }
+}
+
+abstract interface class ConnectionSecretStore {
+  Future<String?> read(String connectionKey);
+  Future<void> write(String connectionKey, String password);
+  Future<void> delete(String connectionKey);
+}
+
+class SecureConnectionSecretStore implements ConnectionSecretStore {
+  static const _storage = FlutterSecureStorage();
+
+  const SecureConnectionSecretStore();
+
+  String _key(String connectionKey) {
+    return 'postgres.password.${base64Url.encode(utf8.encode(connectionKey))}';
+  }
+
+  @override
+  Future<String?> read(String connectionKey) {
+    return _storage.read(key: _key(connectionKey));
+  }
+
+  @override
+  Future<void> write(String connectionKey, String password) {
+    if (password.isEmpty) return delete(connectionKey);
+    return _storage.write(key: _key(connectionKey), value: password);
+  }
+
+  @override
+  Future<void> delete(String connectionKey) {
+    return _storage.delete(key: _key(connectionKey));
   }
 }
 
@@ -156,23 +232,76 @@ class PostgresQueryException implements Exception {
   String toString() => cause.toString();
 }
 
+class PostgresRowUpdate {
+  final String schema;
+  final String table;
+  final Map<String, Object?> changes;
+  final Map<String, Object?> primaryKey;
+  final Map<String, Object?> originalValues;
+
+  const PostgresRowUpdate({
+    required this.schema,
+    required this.table,
+    required this.changes,
+    required this.primaryKey,
+    required this.originalValues,
+  });
+}
+
+class PostgresRowConflictException implements Exception {
+  final String schema;
+  final String table;
+  final Map<String, Object?> primaryKey;
+
+  const PostgresRowConflictException({
+    required this.schema,
+    required this.table,
+    required this.primaryKey,
+  });
+
+  @override
+  String toString() {
+    return 'Row changed or was deleted before save: $schema.$table '
+        '${primaryKey.entries.map((entry) => '${entry.key}=${entry.value}').join(', ')}';
+  }
+}
+
 class PostgresDatabase {
   static const int defaultMaxRows = 10000;
   static const int defaultChunkSize = 500;
 
   final PostgresConnectionConfig config;
   final Connection _connection;
+  final int _backendPid;
+  Connection? _controlConnection;
+  bool _queryRunning = false;
   final List<DatabaseSchema> _schemaCache = [];
   final Map<String, List<DatabaseTable>> _tableCache = {};
   final Map<String, DatabaseTable> _tableDetailCache = {};
 
-  PostgresDatabase._({required this.config, required Connection connection})
-    : _connection = connection;
+  PostgresDatabase._({
+    required this.config,
+    required Connection connection,
+    required int backendPid,
+  }) : _connection = connection,
+       _backendPid = backendPid;
 
   static Future<PostgresDatabase> connect(
     PostgresConnectionConfig config,
   ) async {
-    final connection = await Connection.open(
+    final connection = await _openConnection(config);
+    final pidResult = await connection.execute('SELECT pg_backend_pid();');
+    final backendPid = pidResult.first[0] as int;
+
+    return PostgresDatabase._(
+      config: config,
+      connection: connection,
+      backendPid: backendPid,
+    );
+  }
+
+  static Future<Connection> _openConnection(PostgresConnectionConfig config) {
+    return Connection.open(
       Endpoint(
         host: config.host,
         port: config.port,
@@ -187,8 +316,6 @@ class PostgresDatabase {
         sslMode: config.sslMode,
       ),
     );
-
-    return PostgresDatabase._(config: config, connection: connection);
   }
 
   Future<List<DatabaseSchema>> loadSchemas({bool forceRefresh = false}) async {
@@ -422,6 +549,7 @@ ORDER BY trigger_name, event_manipulation;
     final stopwatch = Stopwatch()..start();
     final effectiveSql = _limitReadQuery(sql, maxRows);
     late final Result result;
+    _queryRunning = true;
     try {
       result = await _connection.execute(effectiveSql.sql);
     } on ServerException catch (error) {
@@ -432,6 +560,8 @@ ORDER BY trigger_name, event_manipulation;
             ? null
             : (position - effectiveSql.positionOffset).clamp(1, sql.length + 1),
       );
+    } finally {
+      _queryRunning = false;
     }
     stopwatch.stop();
 
@@ -479,49 +609,77 @@ ORDER BY trigger_name, event_manipulation;
     );
   }
 
-  Future<int> updateRow({
-    required String schema,
-    required String table,
-    required Map<String, Object?> changes,
-    required Map<String, Object?> primaryKey,
-  }) async {
-    if (changes.isEmpty || primaryKey.isEmpty) return 0;
+  Future<int> updateRows(List<PostgresRowUpdate> updates) async {
+    if (updates.isEmpty) return 0;
 
-    final parameters = <String, Object?>{};
-    final assignments = <String>[];
-    var index = 0;
-    for (final entry in changes.entries) {
-      final parameter = 'set_$index';
-      assignments.add('${_quoteIdentifier(entry.key)} = @$parameter');
-      parameters[parameter] = entry.value;
-      index++;
-    }
+    return _connection.runTx((session) async {
+      var totalAffected = 0;
+      for (final update in updates) {
+        final parameters = <String, Object?>{};
+        final assignments = <String>[];
+        var index = 0;
+        for (final entry in update.changes.entries) {
+          final parameter = 'set_$index';
+          assignments.add('${_quoteIdentifier(entry.key)} = @$parameter');
+          parameters[parameter] = entry.value;
+          index++;
+        }
 
-    final predicates = <String>[];
-    index = 0;
-    for (final entry in primaryKey.entries) {
-      final parameter = 'pk_$index';
-      if (entry.value == null) {
-        predicates.add('${_quoteIdentifier(entry.key)} IS NULL');
-      } else {
-        predicates.add('${_quoteIdentifier(entry.key)} = @$parameter');
-        parameters[parameter] = entry.value;
+        final predicates = <String>[];
+        index = 0;
+        for (final entry in update.primaryKey.entries) {
+          final parameter = 'pk_$index';
+          predicates.add(
+            '${_quoteIdentifier(entry.key)} IS NOT DISTINCT FROM @$parameter',
+          );
+          parameters[parameter] = entry.value;
+          index++;
+        }
+        for (final entry in update.originalValues.entries) {
+          final parameter = 'original_$index';
+          predicates.add(
+            '${_quoteIdentifier(entry.key)} IS NOT DISTINCT FROM @$parameter',
+          );
+          parameters[parameter] = entry.value;
+          index++;
+        }
+
+        final result = await session.execute(
+          Sql.named(
+            'UPDATE ${_quoteIdentifier(update.schema)}.'
+            '${_quoteIdentifier(update.table)} '
+            'SET ${assignments.join(', ')} '
+            'WHERE ${predicates.join(' AND ')};',
+          ),
+          parameters: parameters,
+        );
+        if (result.affectedRows != 1) {
+          throw PostgresRowConflictException(
+            schema: update.schema,
+            table: update.table,
+            primaryKey: update.primaryKey,
+          );
+        }
+        totalAffected += result.affectedRows;
       }
-      index++;
-    }
-
-    final result = await _connection.execute(
-      Sql.named(
-        'UPDATE ${_quoteIdentifier(schema)}.${_quoteIdentifier(table)} '
-        'SET ${assignments.join(', ')} '
-        'WHERE ${predicates.join(' AND ')};',
-      ),
-      parameters: parameters,
-    );
-    return result.affectedRows;
+      return totalAffected;
+    });
   }
 
-  Future<void> close() => _connection.close();
+  Future<bool> cancelCurrentQuery() async {
+    if (!_queryRunning) return false;
+    final control = _controlConnection ??= await _openConnection(config);
+    final result = await control.execute(
+      Sql.named('SELECT pg_cancel_backend(@pid);'),
+      parameters: {'pid': _backendPid},
+    );
+    return result.isNotEmpty && result.first[0] == true;
+  }
+
+  Future<void> close() async {
+    await _controlConnection?.close();
+    await _connection.close();
+  }
 
   static String _columnName(String? name, int index) {
     if (name != null && name.isNotEmpty) {

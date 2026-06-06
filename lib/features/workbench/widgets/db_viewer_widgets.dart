@@ -7,79 +7,83 @@ import '../../database/services/postgres_database.dart';
 class AppTitleBar extends StatelessWidget {
   final String connectionName;
   final String status;
+  final bool nativeWindowChrome;
 
   const AppTitleBar({
     super.key,
     required this.connectionName,
     required this.status,
+    this.nativeWindowChrome = true,
   });
 
   @override
   Widget build(BuildContext context) {
     final connected = status.toLowerCase() == 'connected';
 
-    return WindowTitleBarBox(
-      child: Container(
-        height: 36,
-        decoration: const BoxDecoration(
-          color: Color(0xff242628),
-          border: Border(bottom: BorderSide(color: Color(0xff111111))),
-        ),
-        child: Row(
-          children: [
-            const SizedBox(width: 12),
-            const Icon(Icons.storage, color: Color(0xff8ab4f8), size: 18),
-            const SizedBox(width: 8),
-            const Text(
-              'DB Viewer',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
-              ),
+    final content = Container(
+      height: 36,
+      decoration: const BoxDecoration(
+        color: Color(0xff242628),
+        border: Border(bottom: BorderSide(color: Color(0xff111111))),
+      ),
+      child: Row(
+        children: [
+          const SizedBox(width: 12),
+          const Icon(Icons.storage, color: Color(0xff8ab4f8), size: 18),
+          const SizedBox(width: 8),
+          const Text(
+            'DB Viewer',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
             ),
-            const SizedBox(width: 14),
-            Container(
-              constraints: const BoxConstraints(maxWidth: 320),
-              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-              decoration: BoxDecoration(
+          ),
+          const SizedBox(width: 14),
+          Container(
+            constraints: const BoxConstraints(maxWidth: 320),
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+            decoration: BoxDecoration(
+              color: connected
+                  ? const Color(0xff1f3a2c)
+                  : const Color(0xff3a3020),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
                 color: connected
-                    ? const Color(0xff1f3a2c)
-                    : const Color(0xff3a3020),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(
-                  color: connected
-                      ? const Color(0xff3fb46f)
-                      : const Color(0xffa87525),
-                ),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    connected ? Icons.circle : Icons.circle_outlined,
-                    size: 9,
-                    color: connected
-                        ? const Color(0xff77d697)
-                        : const Color(0xffffc166),
-                  ),
-                  const SizedBox(width: 7),
-                  Flexible(
-                    child: Text(
-                      '$status - $connectionName',
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: Colors.white, fontSize: 12),
-                    ),
-                  ),
-                ],
+                    ? const Color(0xff3fb46f)
+                    : const Color(0xffa87525),
               ),
             ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  connected ? Icons.circle : Icons.circle_outlined,
+                  size: 9,
+                  color: connected
+                      ? const Color(0xff77d697)
+                      : const Color(0xffffc166),
+                ),
+                const SizedBox(width: 7),
+                Flexible(
+                  child: Text(
+                    '$status - $connectionName',
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white, fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (nativeWindowChrome) ...[
             Expanded(child: MoveWindow()),
             const WindowButtons(),
-          ],
-        ),
+          ] else
+            const Spacer(),
+        ],
       ),
     );
+    return nativeWindowChrome ? WindowTitleBarBox(child: content) : content;
   }
 }
 
@@ -929,6 +933,7 @@ class ResultGrid extends StatelessWidget {
   final Future<void> Function(String column)? onFilterColumn;
   final Set<String> filteredColumns;
   final bool editable;
+  final bool Function(int column)? columnEditable;
   final String Function(int row, int column)? cellValue;
   final void Function(int row, int column, String value)? onCellChanged;
   final bool Function(int row, int column)? cellEdited;
@@ -943,6 +948,7 @@ class ResultGrid extends StatelessWidget {
     this.onFilterColumn,
     this.filteredColumns = const {},
     this.editable = false,
+    this.columnEditable,
     this.cellValue,
     this.onCellChanged,
     this.cellEdited,
@@ -1013,7 +1019,7 @@ class ResultGrid extends StatelessWidget {
                       return Row(
                         children: [
                           for (int i = 0; i < columns.length; i++)
-                            editable
+                            editable && (columnEditable?.call(i) ?? true)
                                 ? _EditableGridCell(
                                     key: ValueKey('$rowIndex-$i'),
                                     text:

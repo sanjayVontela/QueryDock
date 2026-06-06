@@ -28,4 +28,27 @@ void main() {
     expect(find.text('ID'), findsOneWidget);
     expect(find.text('Sample Row'), findsOneWidget);
   });
+
+  testWidgets('Result grid only edits eligible columns', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ResultGrid(
+            columns: const ['ID', 'CALCULATED'],
+            rows: const [
+              [1, 'read only'],
+            ],
+            editable: true,
+            columnEditable: (column) => column == 0,
+            onCellChanged: (_, _, _) {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byType(TextField), findsOneWidget);
+    expect(find.text('read only'), findsOneWidget);
+  });
 }
