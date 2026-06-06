@@ -6,31 +6,40 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/database_schema.dart';
 
 class PostgresConnectionConfig {
+  final String name;
   final String host;
   final int port;
   final String database;
   final String username;
   final String password;
   final SslMode sslMode;
+  final bool writeProtected;
 
   const PostgresConnectionConfig({
+    this.name = '',
     required this.host,
     required this.port,
     required this.database,
     required this.username,
     required this.password,
     required this.sslMode,
+    this.writeProtected = false,
   });
 
-  String get displayName => '$username@$host:$port/$database';
+  String get endpointName => '$username@$host:$port/$database';
+
+  String get displayName => name.trim().isEmpty ? endpointName : name.trim();
 
   Map<String, Object?> toStoredJson() {
     return {
+      'name': name,
       'host': host,
       'port': port,
       'database': database,
       'username': username,
+      'password': password,
       'sslMode': sslMode.name,
+      'writeProtected': writeProtected,
     };
   }
 
@@ -41,22 +50,27 @@ class PostgresConnectionConfig {
         : int.tryParse(json['port']?.toString() ?? '');
     final database = json['database']?.toString() ?? '';
     final username = json['username']?.toString() ?? '';
+    final password = json['password']?.toString() ?? '';
+    final name = json['name']?.toString() ?? '';
     final sslModeName = json['sslMode']?.toString() ?? SslMode.disable.name;
+    final writeProtected = json['writeProtected'] == true;
 
     if (host.isEmpty || port == null || database.isEmpty || username.isEmpty) {
       return null;
     }
 
     return PostgresConnectionConfig(
+      name: name,
       host: host,
       port: port,
       database: database,
       username: username,
-      password: '',
+      password: password,
       sslMode: SslMode.values.firstWhere(
         (mode) => mode.name == sslModeName,
         orElse: () => SslMode.disable,
       ),
+      writeProtected: writeProtected,
     );
   }
 }
@@ -80,12 +94,25 @@ class PostgresConnectionStore {
     final profiles = [
       config,
       for (final profile in existingProfiles)
-        if (profile.displayName != config.displayName) profile,
+        if (profile.endpointName != config.endpointName) profile,
     ];
 
     await preferences.setStringList(_storageKey, [
       for (final profile in profiles.take(10))
         jsonEncode(profile.toStoredJson()),
+    ]);
+  }
+
+  Future<void> delete(PostgresConnectionConfig config) async {
+    final preferences = await SharedPreferences.getInstance();
+    final existingProfiles = await load();
+    final profiles = [
+      for (final profile in existingProfiles)
+        if (profile.endpointName != config.endpointName) profile,
+    ];
+
+    await preferences.setStringList(_storageKey, [
+      for (final profile in profiles) jsonEncode(profile.toStoredJson()),
     ]);
   }
 
@@ -117,6 +144,16 @@ class PostgresQueryResult {
     required this.elapsed,
     this.rowLimitApplied = false,
   });
+}
+
+class PostgresQueryException implements Exception {
+  final ServerException cause;
+  final int? position;
+
+  const PostgresQueryException({required this.cause, required this.position});
+
+  @override
+  String toString() => cause.toString();
 }
 
 class PostgresDatabase {
@@ -265,6 +302,24 @@ ORDER BY c.table_schema, c.table_name, c.ordinal_position;
       parameters: {'schema': schema, 'table': table},
     );
 
+    final primaryKeyResult = await _connection.execute(
+      Sql.named('''
+SELECT kcu.column_name
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON kcu.constraint_name = tc.constraint_name
+ AND kcu.constraint_schema = tc.constraint_schema
+WHERE tc.table_schema = @schema
+  AND tc.table_name = @table
+  AND tc.constraint_type = 'PRIMARY KEY'
+ORDER BY kcu.ordinal_position;
+'''),
+      parameters: {'schema': schema, 'table': table},
+    );
+    final primaryKeys = {
+      for (final row in primaryKeyResult) row[0]?.toString() ?? '',
+    };
+
     final columns = <DatabaseColumn>[];
     for (final row in columnResult) {
       final column = row[2]?.toString() ?? '';
@@ -273,15 +328,84 @@ ORDER BY c.table_schema, c.table_name, c.ordinal_position;
       if (column.isEmpty) continue;
 
       columns.add(
-        DatabaseColumn(name: column, dataType: type, nullable: nullable),
+        DatabaseColumn(
+          name: column,
+          dataType: type,
+          nullable: nullable,
+          primaryKey: primaryKeys.contains(column),
+        ),
       );
     }
+
+    final constraintResult = await _connection.execute(
+      Sql.named('''
+SELECT constraint_name, constraint_type
+FROM information_schema.table_constraints
+WHERE table_schema = @schema
+  AND table_name = @table
+ORDER BY constraint_type, constraint_name;
+'''),
+      parameters: {'schema': schema, 'table': table},
+    );
+    final constraints = [
+      for (final row in constraintResult) '${row[0]}  [${row[1]}]',
+    ];
+
+    final indexResult = await _connection.execute(
+      Sql.named('''
+SELECT indexname
+FROM pg_indexes
+WHERE schemaname = @schema
+  AND tablename = @table
+ORDER BY indexname;
+'''),
+      parameters: {'schema': schema, 'table': table},
+    );
+    final indexes = [for (final row in indexResult) row[0]?.toString() ?? ''];
+
+    final foreignKeyResult = await _connection.execute(
+      Sql.named('''
+SELECT tc.constraint_name,
+       ccu.table_schema,
+       ccu.table_name
+FROM information_schema.table_constraints tc
+JOIN information_schema.constraint_column_usage ccu
+  ON ccu.constraint_name = tc.constraint_name
+ AND ccu.constraint_schema = tc.constraint_schema
+WHERE tc.table_schema = @schema
+  AND tc.table_name = @table
+  AND tc.constraint_type = 'FOREIGN KEY'
+ORDER BY tc.constraint_name;
+'''),
+      parameters: {'schema': schema, 'table': table},
+    );
+    final foreignKeys = [
+      for (final row in foreignKeyResult) '${row[0]}  -> ${row[1]}.${row[2]}',
+    ];
+
+    final triggerResult = await _connection.execute(
+      Sql.named('''
+SELECT trigger_name, event_manipulation
+FROM information_schema.triggers
+WHERE event_object_schema = @schema
+  AND event_object_table = @table
+ORDER BY trigger_name, event_manipulation;
+'''),
+      parameters: {'schema': schema, 'table': table},
+    );
+    final triggers = [
+      for (final row in triggerResult) '${row[0]}  [${row[1]}]',
+    ];
 
     final loadedTable = DatabaseTable(
       name: table,
       columns: columns,
       ddl: _buildCreateTableDdl(schema, table, columns),
       columnsLoaded: true,
+      constraints: constraints,
+      indexes: indexes.where((item) => item.isNotEmpty).toList(),
+      foreignKeys: foreignKeys,
+      triggers: triggers,
     );
     _tableDetailCache[cacheKey] = loadedTable;
     _replaceCachedTable(schema, loadedTable);
@@ -297,7 +421,18 @@ ORDER BY c.table_schema, c.table_name, c.ordinal_position;
   }) async {
     final stopwatch = Stopwatch()..start();
     final effectiveSql = _limitReadQuery(sql, maxRows);
-    final result = await _connection.execute(effectiveSql.sql);
+    late final Result result;
+    try {
+      result = await _connection.execute(effectiveSql.sql);
+    } on ServerException catch (error) {
+      final position = error.position;
+      throw PostgresQueryException(
+        cause: error,
+        position: position == null
+            ? null
+            : (position - effectiveSql.positionOffset).clamp(1, sql.length + 1),
+      );
+    }
     stopwatch.stop();
 
     final columns = [
@@ -342,6 +477,48 @@ ORDER BY c.table_schema, c.table_name, c.ordinal_position;
       elapsed: stopwatch.elapsed,
       rowLimitApplied: effectiveSql.limited,
     );
+  }
+
+  Future<int> updateRow({
+    required String schema,
+    required String table,
+    required Map<String, Object?> changes,
+    required Map<String, Object?> primaryKey,
+  }) async {
+    if (changes.isEmpty || primaryKey.isEmpty) return 0;
+
+    final parameters = <String, Object?>{};
+    final assignments = <String>[];
+    var index = 0;
+    for (final entry in changes.entries) {
+      final parameter = 'set_$index';
+      assignments.add('${_quoteIdentifier(entry.key)} = @$parameter');
+      parameters[parameter] = entry.value;
+      index++;
+    }
+
+    final predicates = <String>[];
+    index = 0;
+    for (final entry in primaryKey.entries) {
+      final parameter = 'pk_$index';
+      if (entry.value == null) {
+        predicates.add('${_quoteIdentifier(entry.key)} IS NULL');
+      } else {
+        predicates.add('${_quoteIdentifier(entry.key)} = @$parameter');
+        parameters[parameter] = entry.value;
+      }
+      index++;
+    }
+
+    final result = await _connection.execute(
+      Sql.named(
+        'UPDATE ${_quoteIdentifier(schema)}.${_quoteIdentifier(table)} '
+        'SET ${assignments.join(', ')} '
+        'WHERE ${predicates.join(' AND ')};',
+      ),
+      parameters: parameters,
+    );
+    return result.affectedRows;
   }
 
   Future<void> close() => _connection.close();
@@ -418,6 +595,7 @@ ORDER BY c.table_schema, c.table_name, c.ordinal_position;
       sql:
           'SELECT * FROM (\n$withoutSemicolon\n) AS db_viewer_limited_query LIMIT $maxRows',
       limited: true,
+      positionOffset: 'SELECT * FROM (\n'.length,
     );
   }
 }
@@ -425,6 +603,11 @@ ORDER BY c.table_schema, c.table_name, c.ordinal_position;
 class _LimitedSql {
   final String sql;
   final bool limited;
+  final int positionOffset;
 
-  const _LimitedSql({required this.sql, required this.limited});
+  const _LimitedSql({
+    required this.sql,
+    required this.limited,
+    this.positionOffset = 0,
+  });
 }
