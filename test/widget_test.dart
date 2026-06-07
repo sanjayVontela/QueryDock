@@ -48,7 +48,20 @@ void main() {
       ),
     );
 
-    expect(find.byType(TextField), findsOneWidget);
+    expect(find.byType(TextField), findsNothing);
     expect(find.text('read only'), findsOneWidget);
+
+    await tester.tap(find.text('read only'));
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.tap(find.text('read only'));
+    await tester.pump();
+    expect(find.byType(TextField), findsNothing);
+
+    await tester.tap(find.text('1'));
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.tap(find.text('1'));
+    await tester.pump();
+    expect(find.byType(TextField), findsOneWidget);
+    await tester.pump(const Duration(milliseconds: 400));
   });
 }

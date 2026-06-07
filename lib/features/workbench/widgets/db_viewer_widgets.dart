@@ -32,7 +32,7 @@ class AppTitleBar extends StatelessWidget {
           const Icon(Icons.storage, color: Color(0xff8ab4f8), size: 18),
           const SizedBox(width: 8),
           const Text(
-            'DB Viewer',
+            'QueryDock',
             style: TextStyle(
               color: Colors.white,
               fontSize: 13,
@@ -99,7 +99,10 @@ class DbMenuBar extends StatelessWidget {
   final VoidCallback onInvalidateConnection;
   final VoidCallback onToggleNavigator;
   final VoidCallback onToggleProperties;
+  final VoidCallback onToggleAssistant;
+  final VoidCallback onAiSettings;
   final VoidCallback onToggleOutput;
+  final VoidCallback onToggleTheme;
   final VoidCallback onCopy;
   final VoidCallback onPaste;
   final VoidCallback onSelectAll;
@@ -118,7 +121,10 @@ class DbMenuBar extends StatelessWidget {
     required this.onInvalidateConnection,
     required this.onToggleNavigator,
     required this.onToggleProperties,
+    required this.onToggleAssistant,
+    required this.onAiSettings,
     required this.onToggleOutput,
+    required this.onToggleTheme,
     required this.onCopy,
     required this.onPaste,
     required this.onSelectAll,
@@ -129,7 +135,7 @@ class DbMenuBar extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       height: 32,
-      color: const Color(0xffeeeeee),
+      color: Theme.of(context).colorScheme.surfaceContainer,
       child: Row(
         children: [
           const SizedBox(width: 12),
@@ -200,8 +206,31 @@ class DbMenuBar extends StatelessWidget {
                 child: _MenuCommand('Toggle Properties'),
               ),
               PopupMenuItem(
+                value: 'assistant',
+                child: _MenuCommand('AI Assistant'),
+              ),
+              PopupMenuItem(
                 value: 'output',
                 child: _MenuCommand('Toggle Output'),
+              ),
+              PopupMenuDivider(),
+              PopupMenuItem(
+                value: 'theme',
+                child: _MenuCommand('Toggle Dark Mode'),
+              ),
+            ],
+          ),
+          _WorkbenchMenu(
+            label: 'AI',
+            onSelected: _selectAi,
+            items: const [
+              PopupMenuItem(
+                value: 'assistant',
+                child: _MenuCommand('Open Assistant'),
+              ),
+              PopupMenuItem(
+                value: 'settings',
+                child: _MenuCommand('Provider Settings...'),
               ),
             ],
           ),
@@ -211,7 +240,7 @@ class DbMenuBar extends StatelessWidget {
             items: const [
               PopupMenuItem(
                 value: 'about',
-                child: _MenuCommand('About DB Viewer'),
+                child: _MenuCommand('About QueryDock'),
               ),
             ],
           ),
@@ -279,8 +308,25 @@ class DbMenuBar extends StatelessWidget {
       case 'properties':
         onToggleProperties();
         break;
+      case 'assistant':
+        onToggleAssistant();
+        break;
       case 'output':
         onToggleOutput();
+        break;
+      case 'theme':
+        onToggleTheme();
+        break;
+    }
+  }
+
+  void _selectAi(String value) {
+    switch (value) {
+      case 'assistant':
+        onToggleAssistant();
+        break;
+      case 'settings':
+        onAiSettings();
         break;
     }
   }
@@ -301,6 +347,7 @@ class DbToolbar extends StatelessWidget {
   final VoidCallback onStop;
   final VoidCallback onToggleNavigator;
   final VoidCallback onToggleOutput;
+  final VoidCallback onToggleAssistant;
 
   const DbToolbar({
     super.key,
@@ -312,15 +359,18 @@ class DbToolbar extends StatelessWidget {
     required this.onStop,
     required this.onToggleNavigator,
     required this.onToggleOutput,
+    required this.onToggleAssistant,
   });
 
   @override
   Widget build(BuildContext context) {
     return Container(
       height: 42,
-      decoration: const BoxDecoration(
-        color: Color(0xfff8f8f8),
-        border: Border(bottom: BorderSide(color: Color(0xffd2d2d2))),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        border: Border(
+          bottom: BorderSide(color: Theme.of(context).dividerColor),
+        ),
       ),
       padding: const EdgeInsets.symmetric(horizontal: 8),
       child: Row(
@@ -350,6 +400,12 @@ class DbToolbar extends StatelessWidget {
             onTap: onStop,
           ),
           const Spacer(),
+          ToolbarButton(
+            icon: Icons.auto_awesome_outlined,
+            label: 'AI',
+            tooltip: 'Open AI Assistant',
+            onTap: onToggleAssistant,
+          ),
           ToolbarButton(
             icon: Icons.view_sidebar,
             label: 'Navigator',
@@ -708,7 +764,10 @@ class MenuItemLabel extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 10),
       child: Text(
         text,
-        style: const TextStyle(fontSize: 13, color: Colors.black87),
+        style: TextStyle(
+          fontSize: 13,
+          color: Theme.of(context).colorScheme.onSurface,
+        ),
       ),
     );
   }
@@ -728,7 +787,7 @@ class _WorkbenchMenu extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return PopupMenuButton<String>(
-      tooltip: label,
+      tooltip: '',
       offset: const Offset(0, 28),
       onSelected: onSelected,
       itemBuilder: (context) => items,
@@ -769,7 +828,7 @@ class ToolbarButton extends StatelessWidget {
       icon: Icon(icon, size: 18),
       label: Text(label),
       style: TextButton.styleFrom(
-        foregroundColor: Colors.black87,
+        foregroundColor: Theme.of(context).colorScheme.onSurface,
         padding: const EdgeInsets.symmetric(horizontal: 8),
       ),
     );
@@ -795,11 +854,11 @@ class PanelHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       height: 34,
-      color: const Color(0xffe5e5e5),
+      color: Theme.of(context).colorScheme.surfaceContainer,
       padding: const EdgeInsets.symmetric(horizontal: 8),
       child: Row(
         children: [
-          Icon(icon, size: 16, color: Colors.black87),
+          Icon(icon, size: 16, color: Theme.of(context).colorScheme.onSurface),
           const SizedBox(width: 6),
           Expanded(
             child: Text(
@@ -841,8 +900,12 @@ class EditorTab extends StatelessWidget {
         height: 34,
         padding: const EdgeInsets.only(left: 14, right: 8),
         decoration: BoxDecoration(
-          color: active ? Colors.white : const Color(0xffdddddd),
-          border: const Border(right: BorderSide(color: Color(0xffcccccc))),
+          color: active
+              ? Theme.of(context).colorScheme.surface
+              : Theme.of(context).colorScheme.surfaceContainerHigh,
+          border: Border(
+            right: BorderSide(color: Theme.of(context).dividerColor),
+          ),
         ),
         alignment: Alignment.center,
         child: Row(
@@ -896,9 +959,11 @@ class ResultTab extends StatelessWidget {
         margin: const EdgeInsets.symmetric(vertical: 5, horizontal: 2),
         padding: const EdgeInsets.symmetric(horizontal: 12),
         decoration: BoxDecoration(
-          color: active ? Colors.white : Colors.transparent,
+          color: active
+              ? Theme.of(context).colorScheme.surface
+              : Colors.transparent,
           border: Border.all(
-            color: active ? const Color(0xffb9c8d1) : Colors.transparent,
+            color: active ? Theme.of(context).dividerColor : Colors.transparent,
           ),
           borderRadius: BorderRadius.circular(4),
         ),
@@ -907,7 +972,11 @@ class ResultTab extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             if (icon != null) ...[
-              Icon(icon, size: 15, color: const Color(0xff45616f)),
+              Icon(
+                icon,
+                size: 15,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
               const SizedBox(width: 6),
             ],
             Text(
@@ -924,7 +993,7 @@ class ResultTab extends StatelessWidget {
   }
 }
 
-class ResultGrid extends StatelessWidget {
+class ResultGrid extends StatefulWidget {
   final List<String> columns;
   final List<List<dynamic>> rows;
   final String? sortColumn;
@@ -937,6 +1006,9 @@ class ResultGrid extends StatelessWidget {
   final String Function(int row, int column)? cellValue;
   final void Function(int row, int column, String value)? onCellChanged;
   final bool Function(int row, int column)? cellEdited;
+  final Future<void> Function()? onLoadMore;
+  final bool hasMoreRows;
+  final bool loadingMore;
 
   const ResultGrid({
     super.key,
@@ -952,101 +1024,366 @@ class ResultGrid extends StatelessWidget {
     this.cellValue,
     this.onCellChanged,
     this.cellEdited,
+    this.onLoadMore,
+    this.hasMoreRows = false,
+    this.loadingMore = false,
   });
 
   @override
+  State<ResultGrid> createState() => _ResultGridState();
+}
+
+class _ResultGridState extends State<ResultGrid> {
+  static const _defaultColumnWidth = 150.0;
+  static const _minimumColumnWidth = 80.0;
+  static const _maximumColumnWidth = 600.0;
+  final ScrollController _horizontalController = ScrollController();
+  final ScrollController _verticalController = ScrollController();
+  final Map<String, double> _columnWidths = {};
+  bool _loadRequested = false;
+  List<int> _currentVisibleColumns = const [];
+  int? _editingRow;
+  int? _editingColumn;
+
+  @override
+  void initState() {
+    super.initState();
+    _horizontalController.addListener(_handleHorizontalScroll);
+    _verticalController.addListener(_handleVerticalScroll);
+    _syncColumnWidths();
+  }
+
+  @override
+  void didUpdateWidget(covariant ResultGrid oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _syncColumnWidths();
+    if (oldWidget.columns.length != widget.columns.length ||
+        !oldWidget.columns.indexed.every(
+          (entry) => entry.$2 == widget.columns[entry.$1],
+        )) {
+      _currentVisibleColumns = const [];
+    }
+    if (!widget.loadingMore) _loadRequested = false;
+  }
+
+  @override
+  void dispose() {
+    _horizontalController
+      ..removeListener(_handleHorizontalScroll)
+      ..dispose();
+    _verticalController
+      ..removeListener(_handleVerticalScroll)
+      ..dispose();
+    super.dispose();
+  }
+
+  void _handleHorizontalScroll() {
+    if (!mounted || !_horizontalController.hasClients) return;
+    final viewportWidth = _horizontalController.position.viewportDimension;
+    final next = _visibleColumns(_horizontalController.offset, viewportWidth);
+    if (_sameIndexes(next, _currentVisibleColumns)) return;
+    setState(() => _currentVisibleColumns = next);
+  }
+
+  void _handleVerticalScroll() {
+    if (!_verticalController.hasClients ||
+        _verticalController.position.extentAfter > 240 ||
+        !widget.hasMoreRows ||
+        widget.loadingMore ||
+        _loadRequested ||
+        widget.onLoadMore == null) {
+      return;
+    }
+    _loadRequested = true;
+    widget.onLoadMore!().whenComplete(() {
+      if (mounted) _loadRequested = false;
+    });
+  }
+
+  void _syncColumnWidths() {
+    _columnWidths.removeWhere(
+      (column, width) => !widget.columns.contains(column),
+    );
+    for (final column in widget.columns) {
+      _columnWidths.putIfAbsent(column, () => _defaultColumnWidth);
+    }
+  }
+
+  double _columnWidth(int index) =>
+      _columnWidths[widget.columns[index]] ?? _defaultColumnWidth;
+
+  double _columnLeft(int index) {
+    var left = 0.0;
+    for (var current = 0; current < index; current++) {
+      left += _columnWidth(current);
+    }
+    return left;
+  }
+
+  double get _gridWidth {
+    var width = 0.0;
+    for (var index = 0; index < widget.columns.length; index++) {
+      width += _columnWidth(index);
+    }
+    return width;
+  }
+
+  List<int> _visibleColumns(double offset, double viewportWidth) {
+    final visible = <int>[];
+    var left = 0.0;
+    final start = (offset - _maximumColumnWidth).clamp(0.0, double.infinity);
+    final end = offset + viewportWidth + _maximumColumnWidth;
+    for (var index = 0; index < widget.columns.length; index++) {
+      final right = left + _columnWidth(index);
+      if (right >= start && left <= end) visible.add(index);
+      if (left > end) break;
+      left = right;
+    }
+    return visible;
+  }
+
+  bool _sameIndexes(List<int> left, List<int> right) {
+    if (left.length != right.length) return false;
+    for (var index = 0; index < left.length; index++) {
+      if (left[index] != right[index]) return false;
+    }
+    return true;
+  }
+
+  void _resizeColumn(int index, double delta) {
+    final column = widget.columns[index];
+    final width = (_columnWidth(index) + delta).clamp(
+      _minimumColumnWidth,
+      _maximumColumnWidth,
+    );
+    setState(() => _columnWidths[column] = width);
+  }
+
+  void _beginEditing(int row, int column) {
+    if (!widget.editable || !(widget.columnEditable?.call(column) ?? true)) {
+      return;
+    }
+    setState(() {
+      _editingRow = row;
+      _editingColumn = column;
+    });
+  }
+
+  void _finishEditing() {
+    if (_editingRow == null) return;
+    setState(() {
+      _editingRow = null;
+      _editingColumn = null;
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
-    if (columns.isEmpty) {
-      return const Center(
+    if (widget.columns.isEmpty) {
+      return Center(
         child: Text(
           'No results yet. Click New Connection, then Execute.',
-          style: TextStyle(color: Colors.black54),
+          style: TextStyle(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
         ),
       );
     }
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        final gridWidth = (columns.length * 150)
+        final gridWidth = _gridWidth
             .clamp(constraints.maxWidth, double.infinity)
             .toDouble();
+        final offset = _horizontalController.hasClients
+            ? _horizontalController.offset
+            : 0.0;
+        final calculatedColumns = _visibleColumns(offset, constraints.maxWidth);
+        final visibleColumns = _currentVisibleColumns.isEmpty
+            ? calculatedColumns
+            : _currentVisibleColumns;
+        if (_currentVisibleColumns.isEmpty) {
+          _currentVisibleColumns = calculatedColumns;
+        }
 
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Container(
-              height: 34,
-              color: const Color(0xffeeeeee),
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: SizedBox(
-                  width: gridWidth,
-                  child: Row(
-                    children: [
-                      for (final column in columns)
-                        _FastGridCell(
-                          text: column,
-                          header: true,
-                          width: 150,
-                          sortable: onSortColumn != null,
-                          filterable: onFilterColumn != null,
-                          filtered: filteredColumns.contains(column),
-                          sorted: sortColumn == column,
-                          sortAscending: sortAscending,
-                          onSort: onSortColumn == null
-                              ? null
-                              : () => onSortColumn!(column),
-                          onFilter: onFilterColumn == null
-                              ? null
-                              : () => onFilterColumn!(column),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-            Expanded(
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: SizedBox(
-                  width: gridWidth,
-                  child: ListView.builder(
-                    itemCount: rows.length,
-                    itemExtent: 32,
-                    itemBuilder: (context, rowIndex) {
-                      final row = rows[rowIndex];
-
-                      return Row(
-                        children: [
-                          for (int i = 0; i < columns.length; i++)
-                            editable && (columnEditable?.call(i) ?? true)
-                                ? _EditableGridCell(
-                                    key: ValueKey('$rowIndex-$i'),
-                                    text:
-                                        cellValue?.call(rowIndex, i) ??
-                                        (i < row.length
-                                            ? row[i]?.toString() ?? ''
-                                            : ''),
-                                    width: 150,
-                                    edited:
-                                        cellEdited?.call(rowIndex, i) ?? false,
-                                    onChanged: (value) =>
-                                        onCellChanged?.call(rowIndex, i, value),
-                                  )
-                                : _FastGridCell(
-                                    text: i < row.length
-                                        ? row[i]?.toString() ?? 'NULL'
-                                        : '',
-                                    width: 150,
+        return Scrollbar(
+          controller: _horizontalController,
+          scrollbarOrientation: ScrollbarOrientation.bottom,
+          child: SingleChildScrollView(
+            controller: _horizontalController,
+            scrollDirection: Axis.horizontal,
+            child: SizedBox(
+              width: gridWidth,
+              height: constraints.maxHeight,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Container(
+                    height: 34,
+                    color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                    child: Stack(
+                      children: [
+                        for (final columnIndex in visibleColumns)
+                          Positioned(
+                            left: _columnLeft(columnIndex),
+                            width: _columnWidth(columnIndex),
+                            top: 0,
+                            bottom: 0,
+                            child: Stack(
+                              key: ValueKey(
+                                'result-grid-header-${widget.columns[columnIndex]}',
+                              ),
+                              children: [
+                                _FastGridCell(
+                                  text: widget.columns[columnIndex],
+                                  header: true,
+                                  width: _columnWidth(columnIndex),
+                                  sortable: widget.onSortColumn != null,
+                                  filterable: widget.onFilterColumn != null,
+                                  filtered: widget.filteredColumns.contains(
+                                    widget.columns[columnIndex],
                                   ),
-                        ],
-                      );
-                    },
+                                  sorted:
+                                      widget.sortColumn ==
+                                      widget.columns[columnIndex],
+                                  sortAscending: widget.sortAscending,
+                                  onSort: widget.onSortColumn == null
+                                      ? null
+                                      : () => widget.onSortColumn!(
+                                          widget.columns[columnIndex],
+                                        ),
+                                  onFilter: widget.onFilterColumn == null
+                                      ? null
+                                      : () => widget.onFilterColumn!(
+                                          widget.columns[columnIndex],
+                                        ),
+                                ),
+                                Positioned(
+                                  right: 0,
+                                  top: 0,
+                                  bottom: 0,
+                                  width: 8,
+                                  child: MouseRegion(
+                                    key: ValueKey(
+                                      'result-grid-resize-${widget.columns[columnIndex]}',
+                                    ),
+                                    cursor: SystemMouseCursors.resizeColumn,
+                                    child: GestureDetector(
+                                      behavior: HitTestBehavior.opaque,
+                                      onHorizontalDragUpdate: (details) =>
+                                          _resizeColumn(
+                                            columnIndex,
+                                            details.delta.dx,
+                                          ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
-                ),
+                  Expanded(
+                    child: ListView.builder(
+                      key: const ValueKey('result-grid-rows'),
+                      controller: _verticalController,
+                      itemCount:
+                          widget.rows.length + (widget.loadingMore ? 1 : 0),
+                      itemExtent: 32,
+                      itemBuilder: (context, rowIndex) {
+                        if (rowIndex == widget.rows.length) {
+                          return const Align(
+                            alignment: Alignment.centerLeft,
+                            child: SizedBox(
+                              width: 180,
+                              child: LinearProgressIndicator(minHeight: 2),
+                            ),
+                          );
+                        }
+                        final row = widget.rows[rowIndex];
+                        return RepaintBoundary(
+                          child: Stack(
+                            children: [
+                              for (final columnIndex in visibleColumns)
+                                Positioned(
+                                  left: _columnLeft(columnIndex),
+                                  width: _columnWidth(columnIndex),
+                                  top: 0,
+                                  bottom: 0,
+                                  child:
+                                      _editingRow == rowIndex &&
+                                          _editingColumn == columnIndex
+                                      ? _EditableGridCell(
+                                          key: ValueKey(
+                                            '$rowIndex-$columnIndex',
+                                          ),
+                                          text:
+                                              widget.cellValue?.call(
+                                                rowIndex,
+                                                columnIndex,
+                                              ) ??
+                                              (columnIndex < row.length
+                                                  ? row[columnIndex]
+                                                            ?.toString() ??
+                                                        ''
+                                                  : ''),
+                                          width: _columnWidth(columnIndex),
+                                          edited:
+                                              widget.cellEdited?.call(
+                                                rowIndex,
+                                                columnIndex,
+                                              ) ??
+                                              false,
+                                          onChanged: (value) =>
+                                              widget.onCellChanged?.call(
+                                                rowIndex,
+                                                columnIndex,
+                                                value,
+                                              ),
+                                          onDone: _finishEditing,
+                                        )
+                                      : _FastGridCell(
+                                          text:
+                                              widget.cellValue?.call(
+                                                rowIndex,
+                                                columnIndex,
+                                              ) ??
+                                              (columnIndex < row.length
+                                                  ? row[columnIndex]
+                                                            ?.toString() ??
+                                                        'NULL'
+                                                  : ''),
+                                          width: _columnWidth(columnIndex),
+                                          edited:
+                                              widget.cellEdited?.call(
+                                                rowIndex,
+                                                columnIndex,
+                                              ) ??
+                                              false,
+                                          onDoubleTap:
+                                              widget.editable &&
+                                                  (widget.columnEditable?.call(
+                                                        columnIndex,
+                                                      ) ??
+                                                      true)
+                                              ? () => _beginEditing(
+                                                  rowIndex,
+                                                  columnIndex,
+                                                )
+                                              : null,
+                                        ),
+                                ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
               ),
             ),
-          ],
+          ),
         );
       },
     );
@@ -1058,6 +1395,7 @@ class _EditableGridCell extends StatefulWidget {
   final double width;
   final bool edited;
   final ValueChanged<String> onChanged;
+  final VoidCallback onDone;
 
   const _EditableGridCell({
     super.key,
@@ -1065,6 +1403,7 @@ class _EditableGridCell extends StatefulWidget {
     required this.width,
     required this.edited,
     required this.onChanged,
+    required this.onDone,
   });
 
   @override
@@ -1073,11 +1412,17 @@ class _EditableGridCell extends StatefulWidget {
 
 class _EditableGridCellState extends State<_EditableGridCell> {
   late final TextEditingController _controller;
+  late final FocusNode _focusNode;
+  bool _committed = false;
 
   @override
   void initState() {
     super.initState();
     _controller = TextEditingController(text: widget.text);
+    _focusNode = FocusNode()..addListener(_handleFocus);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focusNode.requestFocus();
+    });
   }
 
   @override
@@ -1090,8 +1435,22 @@ class _EditableGridCellState extends State<_EditableGridCell> {
 
   @override
   void dispose() {
+    _focusNode
+      ..removeListener(_handleFocus)
+      ..dispose();
     _controller.dispose();
     super.dispose();
+  }
+
+  void _handleFocus() {
+    if (!_focusNode.hasFocus) _commit();
+  }
+
+  void _commit() {
+    if (_committed) return;
+    _committed = true;
+    widget.onChanged(_controller.text);
+    widget.onDone();
   }
 
   @override
@@ -1100,15 +1459,18 @@ class _EditableGridCellState extends State<_EditableGridCell> {
       width: widget.width,
       height: 32,
       decoration: BoxDecoration(
-        color: widget.edited ? const Color(0xfffff5cc) : Colors.white,
-        border: const Border(
-          right: BorderSide(color: Color(0xffd0d0d0)),
-          bottom: BorderSide(color: Color(0xffd0d0d0)),
+        color: widget.edited
+            ? Theme.of(context).colorScheme.tertiaryContainer
+            : Theme.of(context).colorScheme.surface,
+        border: Border(
+          right: BorderSide(color: Theme.of(context).dividerColor),
+          bottom: BorderSide(color: Theme.of(context).dividerColor),
         ),
       ),
       child: TextField(
         controller: _controller,
-        onChanged: widget.onChanged,
+        focusNode: _focusNode,
+        onSubmitted: (_) => _commit(),
         style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
         decoration: const InputDecoration(
           border: InputBorder.none,
@@ -1131,6 +1493,8 @@ class _FastGridCell extends StatelessWidget {
   final bool sortAscending;
   final VoidCallback? onSort;
   final VoidCallback? onFilter;
+  final VoidCallback? onDoubleTap;
+  final bool edited;
 
   const _FastGridCell({
     required this.text,
@@ -1143,82 +1507,93 @@ class _FastGridCell extends StatelessWidget {
     this.sortAscending = true,
     this.onSort,
     this.onFilter,
+    this.onDoubleTap,
+    this.edited = false,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: width,
-      height: header ? 34 : 32,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      alignment: Alignment.centerLeft,
-      decoration: const BoxDecoration(
-        border: Border(
-          right: BorderSide(color: Color(0xffd0d0d0)),
-          bottom: BorderSide(color: Color(0xffd0d0d0)),
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onDoubleTap: onDoubleTap,
+      child: Container(
+        width: width,
+        height: header ? 34 : 32,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        alignment: Alignment.centerLeft,
+        decoration: BoxDecoration(
+          color: edited
+              ? Theme.of(context).colorScheme.tertiaryContainer
+              : null,
+          border: Border(
+            right: BorderSide(color: Theme.of(context).dividerColor),
+            bottom: BorderSide(color: Theme.of(context).dividerColor),
+          ),
         ),
-      ),
-      child: header && (sortable || filterable)
-          ? Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    text,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontFamily: 'Consolas',
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
+        child: header && (sortable || filterable)
+            ? Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      text,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontFamily: 'Consolas',
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                   ),
-                ),
-                SizedBox(
-                  width: 24,
-                  height: 26,
-                  child: IconButton(
-                    tooltip: sorted
-                        ? 'Sort ${sortAscending ? 'descending' : 'ascending'}'
-                        : 'Sort ascending',
-                    padding: EdgeInsets.zero,
-                    visualDensity: VisualDensity.compact,
-                    onPressed: onSort,
-                    icon: Icon(
-                      sorted
-                          ? sortAscending
-                                ? Icons.arrow_upward
-                                : Icons.arrow_downward
-                          : Icons.unfold_more,
-                      size: 15,
-                    ),
-                  ),
-                ),
-                if (filterable)
                   SizedBox(
                     width: 24,
                     height: 26,
                     child: IconButton(
-                      tooltip: filtered ? 'Edit filter' : 'Filter column',
+                      tooltip: sorted
+                          ? 'Sort ${sortAscending ? 'descending' : 'ascending'}'
+                          : 'Sort ascending',
                       padding: EdgeInsets.zero,
                       visualDensity: VisualDensity.compact,
-                      onPressed: onFilter,
+                      onPressed: onSort,
                       icon: Icon(
-                        filtered ? Icons.filter_alt : Icons.filter_alt_outlined,
+                        sorted
+                            ? sortAscending
+                                  ? Icons.arrow_upward
+                                  : Icons.arrow_downward
+                            : Icons.unfold_more,
                         size: 15,
-                        color: filtered ? const Color(0xff1473a8) : null,
                       ),
                     ),
                   ),
-              ],
-            )
-          : Text(
-              text,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontFamily: 'Consolas',
-                fontSize: 12,
-                fontWeight: header ? FontWeight.bold : FontWeight.normal,
+                  if (filterable)
+                    SizedBox(
+                      width: 24,
+                      height: 26,
+                      child: IconButton(
+                        tooltip: filtered ? 'Edit filter' : 'Filter column',
+                        padding: EdgeInsets.zero,
+                        visualDensity: VisualDensity.compact,
+                        onPressed: onFilter,
+                        icon: Icon(
+                          filtered
+                              ? Icons.filter_alt
+                              : Icons.filter_alt_outlined,
+                          size: 15,
+                          color: filtered ? const Color(0xff1473a8) : null,
+                        ),
+                      ),
+                    ),
+                ],
+              )
+            : Text(
+                text,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontFamily: 'Consolas',
+                  fontSize: 12,
+                  fontWeight: header ? FontWeight.bold : FontWeight.normal,
+                ),
               ),
-            ),
+      ),
     );
   }
 }
@@ -1231,8 +1606,13 @@ class MessagesView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (logs.isEmpty) {
-      return const Center(
-        child: Text('No messages.', style: TextStyle(color: Colors.black54)),
+      return Center(
+        child: Text(
+          'No messages.',
+          style: TextStyle(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+        ),
       );
     }
 
@@ -1269,8 +1649,8 @@ class MessagesView extends StatelessWidget {
               Expanded(
                 child: SelectableText(
                   log,
-                  style: const TextStyle(
-                    color: Colors.black87,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurface,
                     fontFamily: 'Consolas',
                     fontSize: 12,
                     height: 1.35,
@@ -1296,15 +1676,20 @@ class PropertyRow extends StatelessWidget {
     return Container(
       height: 32,
       padding: const EdgeInsets.symmetric(horizontal: 10),
-      decoration: const BoxDecoration(
-        border: Border(bottom: BorderSide(color: Color(0xffe0e0e0))),
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: Theme.of(context).dividerColor),
+        ),
       ),
       child: Row(
         children: [
           Expanded(
             child: Text(
               name,
-              style: const TextStyle(fontSize: 12, color: Colors.black54),
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
           ),
           Text(value, style: const TextStyle(fontSize: 12)),
@@ -1392,7 +1777,7 @@ class TreeItem extends StatelessWidget {
                     ? Icons.keyboard_arrow_down
                     : Icons.keyboard_arrow_right,
                 size: 16,
-                color: Colors.black54,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
               )
             else
               const SizedBox(width: 16),

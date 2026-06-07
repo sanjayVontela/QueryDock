@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_code_editor/flutter_code_editor.dart';
+import 'package:flutter_highlight/themes/atom-one-dark.dart';
 import 'package:flutter_highlight/themes/github.dart';
 import 'package:highlight/languages/sql.dart';
 import 'package:panes/panes.dart';
@@ -11,8 +12,11 @@ import 'package:path_provider/path_provider.dart';
 import 'package:postgres/postgres.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../services/theme_controller.dart';
+import '../ai/services/openai_assistant.dart';
 import '../database/models/database_schema.dart';
 import '../database/services/postgres_database.dart';
+import '../database/services/result_indexer.dart';
 import 'widgets/db_viewer_widgets.dart';
 
 class MyHomePage extends StatefulWidget {
@@ -35,6 +39,10 @@ class _MyHomePageState extends State<MyHomePage> {
 
   late final IdeController _controller;
   final PostgresConnectionStore _connectionStore = PostgresConnectionStore();
+  final AiAssistantSettingsStore _aiSettingsStore =
+      const AiAssistantSettingsStore();
+  final AiAssistantClient _aiClient = AiAssistantClient();
+  final TextEditingController _aiPromptController = TextEditingController();
 
   PostgresDatabase? _database;
   PostgresDatabase? _executingDatabase;
@@ -42,7 +50,10 @@ class _MyHomePageState extends State<MyHomePage> {
   bool _cancelRequested = false;
   bool _isConnecting = false;
   bool _showAllSqlScripts = false;
+  bool _aiSending = false;
   double _resultPanelHeight = 260;
+  String _rightPanelMode = 'properties';
+  AiAssistantSettings _aiSettings = const AiAssistantSettings();
 
   String _activeConnection = 'No Connection';
   String _activeSchema = '-';
@@ -59,6 +70,9 @@ class _MyHomePageState extends State<MyHomePage> {
   List<DatabaseColumn> _resultColumnMetadata = [];
   final Map<String, _ColumnFilter> _resultColumnFilters = {};
   final Map<int, Map<int, String>> _resultPendingChanges = {};
+  List<int> _visibleResultIndexes = [];
+  bool _resultIndexesReady = false;
+  int _resultIndexGeneration = 0;
   String? _resultSortColumn;
   bool _resultSortAscending = true;
 
@@ -67,6 +81,9 @@ class _MyHomePageState extends State<MyHomePage> {
   final List<_OpenTableTab> _openTableTabs = [];
   final Set<String> _loadingSchemas = {};
   final Set<String> _loadingTables = {};
+  final Set<String> _autocompleteSchemaLoads = {};
+  final List<AiAssistantMessage> _aiMessages = [];
+  final List<_AiAttachment> _aiAttachments = [];
 
   final ValueNotifier<String> _activeResultTab = ValueNotifier('Data');
 
@@ -76,14 +93,16 @@ class _MyHomePageState extends State<MyHomePage> {
 
     _controller = IdeController(
       leftSize: PaneSize.pixel(280),
-      rightSize: PaneSize.pixel(240),
+      rightSize: PaneSize.pixel(380),
       bottomSize: PaneSize.pixel(180),
       bottomVisible: true,
     );
+    _controller.rootController.show(IdePane.right.id);
 
-    _logs = ['[INFO] DB Viewer started', '[INFO] No database connected'];
+    _logs = ['[INFO] QueryDock started', '[INFO] No database connected'];
     _initializeSqlEditor();
     _loadSavedConnections();
+    _loadAiSettings();
   }
 
   @override
@@ -98,6 +117,7 @@ class _MyHomePageState extends State<MyHomePage> {
       unawaited(connection.database?.close() ?? Future<void>.value());
     }
     _activeResultTab.dispose();
+    _aiPromptController.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -118,6 +138,386 @@ class _MyHomePageState extends State<MyHomePage> {
         _logs.add('[INFO] Loaded ${savedConnections.length} saved connections');
       }
     });
+  }
+
+  Future<void> _loadAiSettings() async {
+    final settings = await _aiSettingsStore.load();
+    if (!mounted) return;
+    setState(() => _aiSettings = settings);
+  }
+
+  void _showAiAssistant() {
+    setState(() {
+      _rightPanelMode = 'assistant';
+      if (!_controller.rootController.isVisible(IdePane.right.id)) {
+        _controller.rootController.show(IdePane.right.id);
+      }
+    });
+  }
+
+  Future<void> _showAiSettings() async {
+    final settings = await showDialog<AiAssistantSettings>(
+      context: context,
+      builder: (context) => _AiSettingsDialog(initial: _aiSettings),
+    );
+    if (settings == null) return;
+    await _aiSettingsStore.save(settings);
+    if (!mounted) return;
+    setState(() {
+      _aiSettings = settings;
+      _rightPanelMode = 'assistant';
+      _logs.add('[INFO] AI assistant settings saved');
+    });
+  }
+
+  void _attachCurrentScript() {
+    final tab = _activeSqlTab;
+    if (tab == null || tab.controller.text.trim().isEmpty) return;
+    _addAiAttachment(
+      _AiAttachment(
+        id: 'script:${tab.title}',
+        label: tab.title,
+        icon: Icons.description_outlined,
+        content: 'SQL script "${tab.title}":\n${tab.controller.text}',
+      ),
+    );
+  }
+
+  void _attachSelectedSql() {
+    final tab = _activeSqlTab;
+    if (tab == null) return;
+    final selection = tab.controller.selection;
+    if (!selection.isValid || selection.isCollapsed) {
+      setState(() => _logs.add('[WARN] Select SQL before attaching it.'));
+      return;
+    }
+    final sql = selection.textInside(tab.controller.text).trim();
+    if (sql.isEmpty) return;
+    _addAiAttachment(
+      _AiAttachment(
+        id: 'selection:${tab.title}:$sql',
+        label: 'Selected SQL',
+        icon: Icons.code,
+        content: 'Selected SQL from "${tab.title}":\n$sql',
+      ),
+    );
+  }
+
+  Future<void> _attachSchema() async {
+    final connection = _activeOpenConnection;
+    if (connection == null || connection.schemas.isEmpty) {
+      setState(() {
+        _logs.add('[WARN] Connect and load a schema before attaching it.');
+      });
+      return;
+    }
+    final schema = await showDialog<DatabaseSchema>(
+      context: context,
+      builder: (context) => _AiSchemaPicker(schemas: connection.schemas),
+    );
+    if (!mounted || schema == null) return;
+    _attachSchemaContext(connection, schema);
+  }
+
+  void _attachSchemaContext(_OpenConnection connection, DatabaseSchema schema) {
+    _addAiAttachment(
+      _AiAttachment(
+        id: 'schema:${connection.config.endpointName}:${schema.name}',
+        label: schema.name,
+        icon: Icons.account_tree_outlined,
+        content: _schemaAiContext(connection, schema),
+      ),
+    );
+  }
+
+  Future<void> _attachTable() async {
+    final connection = _activeOpenConnection;
+    if (connection == null) {
+      setState(() => _logs.add('[WARN] Connect before attaching a table.'));
+      return;
+    }
+    final choices = [
+      for (final schema in connection.schemas)
+        for (final table in schema.tables)
+          _AiTableChoice(schema: schema.name, table: table),
+    ];
+    if (choices.isEmpty) {
+      setState(() {
+        _logs.add('[WARN] Expand a schema to load its tables first.');
+      });
+      return;
+    }
+    final choice = await showDialog<_AiTableChoice>(
+      context: context,
+      builder: (context) => _AiTablePicker(tables: choices),
+    );
+    if (!mounted || choice == null) return;
+
+    var table = choice.table;
+    if (!table.columnsLoaded) {
+      await _loadTableColumnsForConnection(connection, choice.schema, table);
+      table =
+          connection.schemas
+              .where((schema) => schema.name == choice.schema)
+              .expand((schema) => schema.tables)
+              .where((candidate) => candidate.name == table.name)
+              .firstOrNull ??
+          table;
+    }
+    if (!mounted) return;
+    _attachTableContext(connection, choice.schema, table);
+  }
+
+  void _attachTableContext(
+    _OpenConnection connection,
+    String schema,
+    DatabaseTable table,
+  ) {
+    _addAiAttachment(
+      _AiAttachment(
+        id: 'table:${connection.config.endpointName}:$schema.${table.name}',
+        label: '$schema.${table.name}',
+        icon: Icons.table_chart_outlined,
+        content: _tableAiContext(schema, table),
+      ),
+    );
+  }
+
+  Future<void> _attachNavigatorSchema(
+    _OpenConnection connection,
+    DatabaseSchema schema,
+  ) async {
+    if (!await _ensureConnection(connection)) return;
+    if (!schema.tablesLoaded) {
+      await _loadSchemaTables(connection, schema.name);
+    }
+    if (!mounted) return;
+    final loaded =
+        connection.schemas
+            .where((item) => item.name == schema.name)
+            .firstOrNull ??
+        schema;
+    _attachSchemaContext(connection, loaded);
+  }
+
+  Future<void> _attachNavigatorTable(
+    _OpenConnection connection,
+    String schema,
+    DatabaseTable table,
+  ) async {
+    if (!await _ensureConnection(connection)) return;
+    var loaded = table;
+    if (!table.columnsLoaded) {
+      await _loadTableColumnsForConnection(connection, schema, table);
+      loaded =
+          connection.schemas
+              .where((item) => item.name == schema)
+              .expand((item) => item.tables)
+              .where((item) => item.name == table.name)
+              .firstOrNull ??
+          table;
+    }
+    if (!mounted) return;
+    _attachTableContext(connection, schema, loaded);
+  }
+
+  void _addAiAttachment(_AiAttachment attachment) {
+    setState(() {
+      _rightPanelMode = 'assistant';
+      _aiAttachments.removeWhere((item) => item.id == attachment.id);
+      _aiAttachments.add(attachment);
+    });
+  }
+
+  String _schemaAiContext(_OpenConnection connection, DatabaseSchema schema) {
+    final buffer = StringBuffer()
+      ..writeln('Connection: ${connection.config.displayName}')
+      ..writeln('Database: ${connection.config.database}')
+      ..writeln('Schema: ${schema.name}');
+    if (schema.tables.isEmpty) {
+      buffer.writeln('Tables: metadata not loaded');
+    } else {
+      buffer.writeln('Tables:');
+      for (final table in schema.tables) {
+        buffer.writeln('- ${table.name}');
+        if (table.columnsLoaded) {
+          for (final column in table.columns) {
+            buffer.writeln(
+              '  - ${column.name}: ${column.dataType}'
+              '${column.primaryKey ? ' PRIMARY KEY' : ''}'
+              '${column.nullable ? '' : ' NOT NULL'}',
+            );
+          }
+        }
+      }
+    }
+    return buffer.toString();
+  }
+
+  String _tableAiContext(String schema, DatabaseTable table) {
+    final buffer = StringBuffer()
+      ..writeln('PostgreSQL table: $schema.${table.name}')
+      ..writeln('Columns:');
+    for (final column in table.columns) {
+      buffer.writeln(
+        '- ${column.name}: ${column.dataType}'
+        '${column.primaryKey ? ' PRIMARY KEY' : ''}'
+        '${column.nullable ? '' : ' NOT NULL'}',
+      );
+    }
+    if (table.constraints.isNotEmpty) {
+      buffer
+        ..writeln('Constraints:')
+        ..writeln(table.constraints.map((item) => '- $item').join('\n'));
+    }
+    if (table.indexes.isNotEmpty) {
+      buffer
+        ..writeln('Indexes:')
+        ..writeln(table.indexes.map((item) => '- $item').join('\n'));
+    }
+    if (table.foreignKeys.isNotEmpty) {
+      buffer
+        ..writeln('Foreign keys:')
+        ..writeln(table.foreignKeys.map((item) => '- $item').join('\n'));
+    }
+    return buffer.toString();
+  }
+
+  Future<void> _sendAiPrompt() async {
+    final prompt = _aiPromptController.text.trim();
+    if (prompt.isEmpty || _aiSending) return;
+    if (!_aiSettings.configured) {
+      await _showAiSettings();
+      if (!_aiSettings.configured) return;
+    }
+
+    final userMessage = AiAssistantMessage(role: 'user', text: prompt);
+    final conversation = [..._aiMessages, userMessage];
+    setState(() {
+      _aiMessages.add(userMessage);
+      _aiPromptController.clear();
+      _aiSending = true;
+    });
+
+    try {
+      final response = await _aiClient.respond(
+        settings: _aiSettings,
+        conversation: conversation,
+        context: _aiAttachments.map((item) => item.content).join('\n\n---\n\n'),
+      );
+      if (!mounted) return;
+      setState(() {
+        _aiMessages.add(AiAssistantMessage(role: 'assistant', text: response));
+        _aiSending = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _aiMessages.add(
+          AiAssistantMessage(role: 'assistant', text: 'Error: $error'),
+        );
+        _aiSending = false;
+      });
+    }
+  }
+
+  String? _sqlFromAiMessage(String text) {
+    return RegExp(
+      r'```sql\s*([\s\S]*?)```',
+      caseSensitive: false,
+    ).firstMatch(text)?.group(1)?.trim();
+  }
+
+  void _insertAiSql(String sql) {
+    final controller = _activeSqlTab?.controller;
+    if (controller == null) return;
+    final selection = controller.selection;
+    final start = selection.isValid ? selection.start : controller.text.length;
+    final end = selection.isValid ? selection.end : controller.text.length;
+    final prefix =
+        start > 0 && !controller.text.substring(0, start).endsWith('\n')
+        ? '\n'
+        : '';
+    final insertion = '$prefix$sql';
+    controller.value = TextEditingValue(
+      text: controller.text.replaceRange(start, end, insertion),
+      selection: TextSelection.collapsed(offset: start + insertion.length),
+    );
+    controller.selection = TextSelection.collapsed(
+      offset: start + insertion.length,
+    );
+    _activeSqlTab?.focusNode.requestFocus();
+  }
+
+  Future<void> _openAiSqlInNewScript(String sql) async {
+    await _newSqlScript();
+    final tab = _activeSqlTab;
+    if (tab == null) return;
+    tab.controller.value = TextEditingValue(
+      text: sql,
+      selection: TextSelection.collapsed(offset: sql.length),
+    );
+  }
+
+  Future<void> _requestAiCompletion(_SqlScriptTab tab) async {
+    if (tab.aiCompleting) return;
+    if (!_aiSettings.configured) {
+      await _showAiSettings();
+      if (!_aiSettings.configured) return;
+    }
+    final selection = tab.controller.selection;
+    final cursor = selection.isValid
+        ? selection.baseOffset.clamp(0, tab.controller.text.length)
+        : tab.controller.text.length;
+    final prefix = tab.controller.text.substring(0, cursor);
+    if (prefix.trim().isEmpty) return;
+
+    setState(() {
+      tab.aiCompleting = true;
+      tab.aiSuggestion = null;
+    });
+    try {
+      final response = await _aiClient.respond(
+        settings: _aiSettings,
+        conversation: [
+          AiAssistantMessage(
+            role: 'user',
+            text:
+                'Continue the SQL at the cursor. Return only the SQL text that '
+                'should be appended, inside one ```sql block. Do not repeat the '
+                'existing prefix.\n\nExisting prefix:\n$prefix',
+          ),
+        ],
+        context: _aiAttachments.map((item) => item.content).join('\n\n---\n\n'),
+      );
+      final suggestion = _sqlFromAiMessage(response) ?? response.trim();
+      if (!mounted) return;
+      setState(() {
+        tab.aiCompleting = false;
+        tab.aiSuggestion = suggestion.isEmpty ? null : suggestion;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        tab.aiCompleting = false;
+        _logs.add('[ERROR] AI completion failed: $error');
+      });
+      _showResultTab('Messages');
+    }
+  }
+
+  void _acceptAiCompletion(_SqlScriptTab tab) {
+    final suggestion = tab.aiSuggestion;
+    if (suggestion == null || suggestion.isEmpty) return;
+    final controller = tab.controller;
+    final selection = controller.selection;
+    final start = selection.isValid ? selection.start : controller.text.length;
+    final end = selection.isValid ? selection.end : controller.text.length;
+    controller.value = TextEditingValue(
+      text: controller.text.replaceRange(start, end, suggestion),
+      selection: TextSelection.collapsed(offset: start + suggestion.length),
+    );
+    setState(() => tab.aiSuggestion = null);
   }
 
   Future<void> _newConnection() async {
@@ -449,6 +849,8 @@ class _MyHomePageState extends State<MyHomePage> {
                 setState(() {
                   _columns = columns;
                   _rows = [];
+                  _visibleResultIndexes = [];
+                  _resultIndexesReady = false;
                 });
               }
             : null,
@@ -457,8 +859,9 @@ class _MyHomePageState extends State<MyHomePage> {
                 if (!mounted || !_isExecuting) return;
                 streamedRows.addAll(rows);
                 setState(() {
-                  _rows = List<List<dynamic>>.of(streamedRows);
+                  _rows = streamedRows;
                 });
+                unawaited(_refreshVisibleResultIndexes());
               }
             : null,
       );
@@ -473,7 +876,7 @@ class _MyHomePageState extends State<MyHomePage> {
       setState(() {
         if (updateSqlResults) {
           _columns = result.columns;
-          _rows = result.rows;
+          _rows = streamedRows.isEmpty ? result.rows : streamedRows;
           _resultDatabase = database;
           _resultSchema = resultContext?.schema;
           _resultTable = resultContext?.table;
@@ -482,13 +885,14 @@ class _MyHomePageState extends State<MyHomePage> {
           _resultPendingChanges.clear();
           _resultSortColumn = null;
           _resultSortAscending = true;
+          _resultIndexesReady = false;
         }
         _isExecuting = false;
         _executingDatabase = null;
         _cancelRequested = false;
         _logs.add('[INFO] Query executed successfully');
         _logs.add(
-          '[INFO] ${result.rows.length} rows fetched, ${result.affectedRows} affected in ${result.elapsed.inMilliseconds} ms',
+          '[INFO] ${result.rowCount} rows fetched, ${result.affectedRows} affected in ${result.elapsed.inMilliseconds} ms',
         );
         if (result.rowLimitApplied) {
           _logs.add(
@@ -497,6 +901,7 @@ class _MyHomePageState extends State<MyHomePage> {
         }
       });
       if (updateSqlResults) {
+        await _refreshVisibleResultIndexes();
         _showResultTab('Data');
       }
       return result;
@@ -537,7 +942,7 @@ class _MyHomePageState extends State<MyHomePage> {
     PostgresDatabase database,
     PostgresQueryResult result,
   ) async {
-    if (result.columns.isEmpty || result.rows.isEmpty) return null;
+    if (result.columns.isEmpty || result.rowCount == 0) return null;
     final reference = _singleTableSelectReference(sql);
     if (reference == null) return null;
 
@@ -1398,7 +1803,7 @@ class _MyHomePageState extends State<MyHomePage> {
       _logs.add('[INFO] Applied table filter: ${tab.id}');
     });
 
-    await _loadTableTabData(tab);
+    await _loadTableTabData(tab, reset: true);
   }
 
   void _closeTableTab(_OpenTableTab tab) {
@@ -1429,7 +1834,7 @@ class _MyHomePageState extends State<MyHomePage> {
       );
     });
 
-    await _loadTableTabData(tab);
+    await _loadTableTabData(tab, reset: true);
   }
 
   Future<void> _filterTableColumn(_OpenTableTab tab, String columnName) async {
@@ -1453,7 +1858,7 @@ class _MyHomePageState extends State<MyHomePage> {
         tab.columnFilters[columnName] = filter;
       }
     });
-    await _loadTableTabData(tab);
+    await _loadTableTabData(tab, reset: true);
   }
 
   void _editTableCell(
@@ -1528,7 +1933,7 @@ class _MyHomePageState extends State<MyHomePage> {
         _isExecuting = false;
         _logs.add('[INFO] Saved $affectedRows updated rows');
       });
-      await _loadTableTabData(tab);
+      await _loadTableTabData(tab, reset: true);
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -1595,7 +2000,9 @@ class _MyHomePageState extends State<MyHomePage> {
       } else {
         _resultColumnFilters[columnName] = filter;
       }
+      _resultIndexesReady = false;
     });
+    await _refreshVisibleResultIndexes();
   }
 
   void _sortSqlResult(String columnName) {
@@ -1606,109 +2013,49 @@ class _MyHomePageState extends State<MyHomePage> {
         _resultSortColumn = columnName;
         _resultSortAscending = true;
       }
+      _resultIndexesReady = false;
     });
+    unawaited(_refreshVisibleResultIndexes());
   }
 
   List<({int sourceIndex, List<dynamic> row})> get _visibleSqlResultRows {
-    final visible = <({int sourceIndex, List<dynamic> row})>[];
-    for (final (index, row) in _rows.indexed) {
-      if (_matchesResultFilters(row)) {
-        visible.add((sourceIndex: index, row: row));
-      }
-    }
-    final sortColumn = _resultSortColumn;
-    if (sortColumn != null) {
-      final columnIndex = _columns.indexOf(sortColumn);
-      visible.sort((left, right) {
-        final comparison = _compareResultValues(
-          left.row.elementAtOrNull(columnIndex),
-          right.row.elementAtOrNull(columnIndex),
-        );
-        return _resultSortAscending ? comparison : -comparison;
-      });
-    }
-    return visible;
+    final indexes = _resultIndexesReady
+        ? _visibleResultIndexes
+        : List<int>.generate(_rows.length, (index) => index);
+    return [
+      for (final index in indexes)
+        if (index >= 0 && index < _rows.length)
+          (sourceIndex: index, row: _rows[index]),
+    ];
   }
 
-  bool _matchesResultFilters(List<dynamic> row) {
-    for (final entry in _resultColumnFilters.entries) {
-      final columnIndex = _columns.indexOf(entry.key);
-      if (columnIndex == -1 ||
-          !_matchesResultFilter(
-            row.elementAtOrNull(columnIndex),
-            entry.value,
-          )) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  bool _matchesResultFilter(Object? value, _ColumnFilter filter) {
-    if (filter.operator == 'is-null') return value == null;
-    if (filter.operator == 'is-not-null') return value != null;
-    if (value == null) return false;
-
-    final actual = value.toString();
-    final expected = filter.value;
-    switch (filter.operator) {
-      case 'contains':
-        return actual.toLowerCase().contains(expected.toLowerCase());
-      case 'starts-with':
-        return actual.toLowerCase().startsWith(expected.toLowerCase());
-      case 'ends-with':
-        return actual.toLowerCase().endsWith(expected.toLowerCase());
-      case 'not-equals':
-        return _compareFilterValues(value, expected, filter.kind) != 0;
-      case 'greater-than':
-        return _compareFilterValues(value, expected, filter.kind) > 0;
-      case 'greater-or-equal':
-        return _compareFilterValues(value, expected, filter.kind) >= 0;
-      case 'less-than':
-        return _compareFilterValues(value, expected, filter.kind) < 0;
-      case 'less-or-equal':
-        return _compareFilterValues(value, expected, filter.kind) <= 0;
-      case 'equals':
-      default:
-        return _compareFilterValues(value, expected, filter.kind) == 0;
-    }
-  }
-
-  int _compareFilterValues(
-    Object value,
-    String expected,
-    _ColumnFilterKind kind,
-  ) {
-    switch (kind) {
-      case _ColumnFilterKind.number:
-        return (num.tryParse(value.toString()) ?? 0).compareTo(
-          num.tryParse(expected) ?? 0,
-        );
-      case _ColumnFilterKind.boolean:
-        return value.toString().toLowerCase().compareTo(expected.toLowerCase());
-      case _ColumnFilterKind.dateTime:
-        final actualDate = value is DateTime
-            ? value
-            : DateTime.tryParse(value.toString());
-        final expectedDate = DateTime.tryParse(expected);
-        if (actualDate != null && expectedDate != null) {
-          return actualDate.compareTo(expectedDate);
-        }
-        return value.toString().compareTo(expected);
-      case _ColumnFilterKind.text:
-        return value.toString().toLowerCase().compareTo(expected.toLowerCase());
-    }
-  }
-
-  int _compareResultValues(Object? left, Object? right) {
-    if (left == null && right == null) return 0;
-    if (left == null) return -1;
-    if (right == null) return 1;
-    if (left is num && right is num) return left.compareTo(right);
-    if (left is DateTime && right is DateTime) return left.compareTo(right);
-    return left.toString().toLowerCase().compareTo(
-      right.toString().toLowerCase(),
+  Future<void> _refreshVisibleResultIndexes() async {
+    final generation = ++_resultIndexGeneration;
+    final rows = List<List<dynamic>>.of(_rows);
+    final filters = <ResultIndexFilter>[
+      for (final entry in _resultColumnFilters.entries)
+        if (_columns.contains(entry.key))
+          ResultIndexFilter(
+            column: _columns.indexOf(entry.key),
+            operator: entry.value.operator,
+            value: entry.value.value,
+            kind: entry.value.kind.name,
+          ),
+    ];
+    final sortColumn = _resultSortColumn == null
+        ? null
+        : _columns.indexOf(_resultSortColumn!);
+    final indexes = await ResultIndexer.build(
+      rows: rows,
+      filters: filters,
+      sortColumn: sortColumn != null && sortColumn >= 0 ? sortColumn : null,
+      sortAscending: _resultSortAscending,
     );
+    if (!mounted || generation != _resultIndexGeneration) return;
+    setState(() {
+      _visibleResultIndexes = indexes;
+      _resultIndexesReady = true;
+    });
   }
 
   bool get _canEditSqlResult {
@@ -1824,18 +2171,45 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  Future<void> _loadTableTabData(_OpenTableTab tab) async {
+  Future<void> _loadTableTabData(_OpenTableTab tab, {bool reset = true}) async {
+    if (tab.loadingPage || (!reset && !tab.hasMoreRows)) return;
+    if (!reset && tab.pendingChanges.isNotEmpty) return;
+
+    setState(() {
+      tab.loadingPage = true;
+      if (reset) {
+        tab.hasMoreRows = true;
+      }
+    });
+
+    final offset = reset ? 0 : tab.rows.length;
     final result = await _runSql(
-      _buildTableDataSql(tab),
+      _buildTableDataSql(tab, offset: offset),
       updateSqlResults: false,
       databaseOverride: tab.database,
     );
-    if (result == null) return;
+    if (result == null) {
+      if (mounted) setState(() => tab.loadingPage = false);
+      return;
+    }
+    final fetchedRows = result.rows;
+    final hasMoreRows = fetchedRows.length > _OpenTableTab.pageSize;
+    final pageRows = fetchedRows.take(_OpenTableTab.pageSize).toList();
     setState(() {
       tab.resultColumns = result.columns;
-      tab.rows = result.rows;
-      tab.pendingChanges.clear();
+      if (reset) {
+        tab.rows = pageRows;
+        tab.pendingChanges.clear();
+      } else {
+        tab.rows.addAll(pageRows);
+      }
+      tab.hasMoreRows = hasMoreRows;
+      tab.loadingPage = false;
     });
+  }
+
+  Future<void> _loadMoreTableRows(_OpenTableTab tab) {
+    return _loadTableTabData(tab, reset: false);
   }
 
   Future<void> _refreshSchemas() async {
@@ -1941,6 +2315,10 @@ class _MyHomePageState extends State<MyHomePage> {
           )
           .firstOrNull;
       if (schema != null) {
+        if (!schema.tablesLoaded && connection != null) {
+          _loadAutocompleteSchemaTables(connection, schema, tab);
+          return const [];
+        }
         return [
           for (final table in schema.tables)
             if (table.name.toLowerCase().startsWith(suffix))
@@ -2054,6 +2432,21 @@ class _MyHomePageState extends State<MyHomePage> {
     }
 
     return completions.take(12).toList();
+  }
+
+  void _loadAutocompleteSchemaTables(
+    _OpenConnection connection,
+    DatabaseSchema schema,
+    _SqlScriptTab tab,
+  ) {
+    final key = '${connection.config.endpointName}.${schema.name}';
+    if (!_autocompleteSchemaLoads.add(key)) return;
+    unawaited(
+      _loadSchemaTables(connection, schema.name).whenComplete(() {
+        _autocompleteSchemaLoads.remove(key);
+        if (mounted) tab.controller.refreshCompletions();
+      }),
+    );
   }
 
   void _insertAutocompleteOption(_SqlCompletion option) {
@@ -2210,7 +2603,7 @@ class _MyHomePageState extends State<MyHomePage> {
   void _showAboutDialog() {
     showAboutDialog(
       context: context,
-      applicationName: 'DB Viewer',
+      applicationName: 'QueryDock',
       applicationVersion: '1.0.0',
       applicationIcon: const Icon(Icons.storage, size: 32),
       children: const [
@@ -2295,7 +2688,7 @@ class _MyHomePageState extends State<MyHomePage> {
     return '"${identifier.replaceAll('"', '""')}"';
   }
 
-  String _buildTableDataSql(_OpenTableTab tab) {
+  String _buildTableDataSql(_OpenTableTab tab, {required int offset}) {
     final filter = tab.filterController.text.trim();
     final filters = [
       if (filter.isNotEmpty) '($filter)',
@@ -2316,9 +2709,13 @@ class _MyHomePageState extends State<MyHomePage> {
       buffer.writeln(
         'ORDER BY ${_quoteIdentifier(tab.sortColumn!)} ${tab.sortAscending ? 'ASC' : 'DESC'}',
       );
+    } else if (tab.primaryKeyColumns.isNotEmpty) {
+      buffer.writeln(
+        'ORDER BY ${tab.primaryKeyColumns.map((column) => _quoteIdentifier(column.name)).join(', ')}',
+      );
     }
 
-    buffer.write('LIMIT 500;');
+    buffer.write('LIMIT ${_OpenTableTab.pageSize + 1} OFFSET $offset;');
     return buffer.toString();
   }
 
@@ -2436,7 +2833,7 @@ class _MyHomePageState extends State<MyHomePage> {
       child: Focus(
         autofocus: true,
         child: Scaffold(
-          backgroundColor: const Color(0xfff3f3f3),
+          backgroundColor: Theme.of(context).colorScheme.surface,
           body: Column(
             children: [
               AppTitleBar(
@@ -2461,14 +2858,19 @@ class _MyHomePageState extends State<MyHomePage> {
                 },
                 onToggleProperties: () {
                   setState(() {
+                    _rightPanelMode = 'properties';
                     _controller.toggleRight();
                   });
                 },
+                onToggleAssistant: _showAiAssistant,
+                onAiSettings: () => unawaited(_showAiSettings()),
                 onToggleOutput: () {
                   setState(() {
                     _controller.toggleBottom();
                   });
                 },
+                onToggleTheme: () =>
+                    unawaited(AppThemeController.toggle(context)),
                 onCopy: _copyFromEditor,
                 onPaste: () => unawaited(_pasteIntoEditor()),
                 onSelectAll: _selectAllSql,
@@ -2491,6 +2893,7 @@ class _MyHomePageState extends State<MyHomePage> {
                     _controller.toggleBottom();
                   });
                 },
+                onToggleAssistant: _showAiAssistant,
               ),
               Expanded(
                 child: IdeLayout(
@@ -2500,7 +2903,7 @@ class _MyHomePageState extends State<MyHomePage> {
                   centerBuilder: (context, animationProgress) =>
                       _buildEditorPanel(animationProgress),
                   rightPanelBuilder: (context, animationProgress) =>
-                      _buildPropertiesPanel(animationProgress),
+                      _buildRightPanel(animationProgress),
                   bottomPanelBuilder: (context, animationProgress) =>
                       _buildOutputPanel(animationProgress),
                 ),
@@ -2515,7 +2918,7 @@ class _MyHomePageState extends State<MyHomePage> {
   Widget _buildCenterTabs() {
     return Container(
       height: 34,
-      color: const Color(0xffe6e6e6),
+      color: Theme.of(context).colorScheme.surfaceContainer,
       child: Row(
         children: [
           for (int i = 0; i < _sqlTabs.length; i++)
@@ -2540,7 +2943,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Widget _buildNavigatorPanel(double animationProgress) {
     return Container(
-      color: const Color(0xfffafafa),
+      color: Theme.of(context).colorScheme.surface,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -2557,11 +2960,14 @@ class _MyHomePageState extends State<MyHomePage> {
             child: ListView(
               children: [
                 if (_connections.isEmpty)
-                  const Padding(
-                    padding: EdgeInsets.all(12),
+                  Padding(
+                    padding: const EdgeInsets.all(12),
                     child: Text(
                       'Add a PostgreSQL connection to begin.',
-                      style: TextStyle(fontSize: 12, color: Colors.black54),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
                     ),
                   ),
                 for (final connection in _connections)
@@ -2611,6 +3017,8 @@ class _MyHomePageState extends State<MyHomePage> {
                       },
                       onCopyName: (name) =>
                           _copyToClipboard(name, 'schema name'),
+                      onAddToAiContext: () =>
+                          unawaited(_attachNavigatorSchema(connection, schema)),
                       tableBuilder: (table) {
                         return _TableTreeItem(
                           connectionKey: connection.config.endpointName,
@@ -2655,6 +3063,13 @@ class _MyHomePageState extends State<MyHomePage> {
                           },
                           onCopyName: (name) =>
                               _copyToClipboard(name, 'table name'),
+                          onAddToAiContext: () => unawaited(
+                            _attachNavigatorTable(
+                              connection,
+                              schema.name,
+                              table,
+                            ),
+                          ),
                           onRefresh: () {
                             unawaited(
                               _ensureConnection(connection).then((connected) {
@@ -2722,12 +3137,12 @@ class _MyHomePageState extends State<MyHomePage> {
                       },
                       child: Container(
                         height: 7,
-                        color: const Color(0xffd8dee2),
+                        color: Theme.of(context).dividerColor,
                         alignment: Alignment.center,
                         child: Container(
                           width: 36,
                           height: 2,
-                          color: const Color(0xff8b9aa3),
+                          color: Theme.of(context).colorScheme.outline,
                         ),
                       ),
                     ),
@@ -2739,7 +3154,7 @@ class _MyHomePageState extends State<MyHomePage> {
                         _buildResultHeader(),
                         Expanded(
                           child: Container(
-                            color: Colors.white,
+                            color: Theme.of(context).colorScheme.surface,
                             child: _buildResultContent(),
                           ),
                         ),
@@ -2762,9 +3177,11 @@ class _MyHomePageState extends State<MyHomePage> {
         return Container(
           height: 42,
           padding: const EdgeInsets.symmetric(horizontal: 8),
-          decoration: const BoxDecoration(
-            color: Color(0xfff5f7f8),
-            border: Border(bottom: BorderSide(color: Color(0xffd8dee2))),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surfaceContainer,
+            border: Border(
+              bottom: BorderSide(color: Theme.of(context).dividerColor),
+            ),
           ),
           child: Row(
             children: [
@@ -2787,7 +3204,13 @@ class _MyHomePageState extends State<MyHomePage> {
                   visualDensity: VisualDensity.compact,
                   onPressed: _isExecuting
                       ? null
-                      : () => setState(_resultColumnFilters.clear),
+                      : () {
+                          setState(() {
+                            _resultColumnFilters.clear();
+                            _resultIndexesReady = false;
+                          });
+                          unawaited(_refreshVisibleResultIndexes());
+                        },
                   icon: const Icon(Icons.filter_alt_off_outlined, size: 18),
                 ),
               if (activeTab == 'Data' && _resultPendingChanges.isNotEmpty) ...[
@@ -2812,7 +3235,10 @@ class _MyHomePageState extends State<MyHomePage> {
                 activeTab == 'Data'
                     ? '${_visibleSqlResultRows.length} / ${_rows.length} rows'
                     : '${_logs.length} messages',
-                style: const TextStyle(fontSize: 12, color: Colors.black54),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
               ),
             ],
           ),
@@ -2823,26 +3249,33 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Widget _buildSqlEditorSurface(_SqlScriptTab sqlTab) {
     return Container(
-      decoration: const BoxDecoration(
-        color: Colors.white,
-        border: Border(bottom: BorderSide(color: Color(0xffd2d2d2))),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        border: Border(
+          bottom: BorderSide(color: Theme.of(context).dividerColor),
+        ),
       ),
       child: Column(
         children: [
           Container(
             height: 34,
             padding: const EdgeInsets.symmetric(horizontal: 10),
-            decoration: const BoxDecoration(
-              color: Color(0xfff5f7f8),
-              border: Border(bottom: BorderSide(color: Color(0xffd8dee2))),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainer,
+              border: Border(
+                bottom: BorderSide(color: Theme.of(context).dividerColor),
+              ),
             ),
             child: Row(
               children: [
                 const Icon(Icons.terminal, size: 16, color: Colors.blueGrey),
                 const SizedBox(width: 8),
-                const Text(
+                Text(
                   'Connection:',
-                  style: TextStyle(fontSize: 12, color: Colors.black54),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
                 ),
                 const SizedBox(width: 6),
                 Expanded(
@@ -2886,6 +3319,21 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
                 const SizedBox(width: 6),
                 IconButton(
+                  tooltip: 'Complete SQL with AI',
+                  onPressed: sqlTab.aiCompleting
+                      ? null
+                      : () => unawaited(_requestAiCompletion(sqlTab)),
+                  icon: sqlTab.aiCompleting
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.auto_awesome_outlined, size: 17),
+                  padding: EdgeInsets.zero,
+                  visualDensity: VisualDensity.compact,
+                ),
+                IconButton(
                   tooltip: 'Save SQL',
                   onPressed: () => unawaited(_saveSql()),
                   icon: const Icon(Icons.save, size: 17),
@@ -2909,6 +3357,10 @@ class _MyHomePageState extends State<MyHomePage> {
               controller: sqlTab.controller,
               focusNode: sqlTab.focusNode,
               error: sqlTab.error,
+              aiSuggestion: sqlTab.aiSuggestion,
+              onAcceptAiSuggestion: () => _acceptAiCompletion(sqlTab),
+              onDismissAiSuggestion: () =>
+                  setState(() => sqlTab.aiSuggestion = null),
               optionsBuilder: (value) => _sqlAutocompleteOptions(sqlTab, value),
               onSelected: _insertAutocompleteOption,
             ),
@@ -2925,9 +3377,11 @@ class _MyHomePageState extends State<MyHomePage> {
         Container(
           height: 42,
           padding: const EdgeInsets.symmetric(horizontal: 8),
-          decoration: const BoxDecoration(
-            color: Color(0xfff5f7f8),
-            border: Border(bottom: BorderSide(color: Color(0xffd8dee2))),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surfaceContainer,
+            border: Border(
+              bottom: BorderSide(color: Theme.of(context).dividerColor),
+            ),
           ),
           child: Row(
             children: [
@@ -2954,7 +3408,7 @@ class _MyHomePageState extends State<MyHomePage> {
         ),
         Expanded(
           child: Container(
-            color: Colors.white,
+            color: Theme.of(context).colorScheme.surface,
             child: _buildTableDataTabContent(tab),
           ),
         ),
@@ -2987,6 +3441,9 @@ class _MyHomePageState extends State<MyHomePage> {
               onClose: () => _closeTableTab(tab),
               hasChanges: tab.pendingChanges.isNotEmpty,
               canEdit: tab.canEdit,
+              loadedRows: tab.rows.length,
+              hasMoreRows: tab.hasMoreRows,
+              loadingMore: tab.loadingPage,
               onSaveChanges: () => unawaited(_saveTableChanges(tab)),
               onCancelChanges: () => _cancelTableChanges(tab),
             ),
@@ -2994,6 +3451,11 @@ class _MyHomePageState extends State<MyHomePage> {
               child: ResultGrid(
                 columns: tab.resultColumns,
                 rows: tab.rows,
+                hasMoreRows: tab.hasMoreRows,
+                loadingMore: tab.loadingPage,
+                onLoadMore: tab.pendingChanges.isEmpty
+                    ? () => _loadMoreTableRows(tab)
+                    : null,
                 sortColumn: tab.sortColumn,
                 sortAscending: tab.sortAscending,
                 filteredColumns: tab.columnFilters.keys.toSet(),
@@ -3018,12 +3480,53 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  Widget _buildPropertiesPanel(double animationProgress) {
+  Widget _buildRightPanel(double animationProgress) {
+    return Column(
+      children: [
+        Container(
+          height: 36,
+          color: Theme.of(context).colorScheme.surfaceContainer,
+          child: Row(
+            children: [
+              Expanded(
+                child: _RightPanelTab(
+                  label: 'Properties',
+                  icon: Icons.info_outline,
+                  active: _rightPanelMode == 'properties',
+                  onTap: () => setState(() => _rightPanelMode = 'properties'),
+                ),
+              ),
+              Expanded(
+                child: _RightPanelTab(
+                  label: 'AI Assistant',
+                  icon: Icons.auto_awesome_outlined,
+                  active: _rightPanelMode == 'assistant',
+                  onTap: _showAiAssistant,
+                ),
+              ),
+              IconButton(
+                tooltip: 'Close panel',
+                onPressed: () => setState(_controller.toggleRight),
+                icon: const Icon(Icons.close, size: 16),
+                visualDensity: VisualDensity.compact,
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: _rightPanelMode == 'assistant'
+              ? _buildAiAssistantPanel()
+              : _buildPropertiesContent(),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPropertiesContent() {
     return Container(
-      color: const Color(0xfffafafa),
+      color: Theme.of(context).colorScheme.surface,
       child: Column(
         children: [
-          const PanelHeader(title: 'Properties', icon: Icons.info_outline),
           PropertyRow(name: 'Connection', value: _activeConnection),
           PropertyRow(name: 'Schema', value: _activeSchema),
           PropertyRow(name: 'Driver', value: _activeDriver),
@@ -3034,6 +3537,207 @@ class _MyHomePageState extends State<MyHomePage> {
             builder: (context, activeTab, child) {
               return PropertyRow(name: 'Result Tab', value: activeTab);
             },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAiAssistantPanel() {
+    return Container(
+      color: Theme.of(context).colorScheme.surface,
+      child: Column(
+        children: [
+          Container(
+            height: 38,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainer,
+              border: Border(
+                bottom: BorderSide(color: Theme.of(context).dividerColor),
+              ),
+            ),
+            child: Row(
+              children: [
+                Tooltip(
+                  message: 'Active provider',
+                  child: Chip(
+                    avatar: Icon(
+                      _aiSettings.provider == AiProvider.openAi
+                          ? Icons.key_outlined
+                          : Icons.code,
+                      size: 14,
+                    ),
+                    label: Text(
+                      _aiSettings.providerName,
+                      style: const TextStyle(fontSize: 11),
+                    ),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ),
+                const SizedBox(width: 4),
+                PopupMenuButton<String>(
+                  tooltip: 'Attach context',
+                  onSelected: (value) {
+                    switch (value) {
+                      case 'script':
+                        _attachCurrentScript();
+                        break;
+                      case 'selection':
+                        _attachSelectedSql();
+                        break;
+                      case 'schema':
+                        unawaited(_attachSchema());
+                        break;
+                      case 'table':
+                        unawaited(_attachTable());
+                        break;
+                    }
+                  },
+                  itemBuilder: (context) => const [
+                    PopupMenuItem(
+                      value: 'script',
+                      child: Text('Current script'),
+                    ),
+                    PopupMenuItem(
+                      value: 'selection',
+                      child: Text('Selected SQL'),
+                    ),
+                    PopupMenuItem(value: 'schema', child: Text('Schema...')),
+                    PopupMenuItem(value: 'table', child: Text('Table...')),
+                  ],
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 8),
+                    child: Row(
+                      children: [
+                        Icon(Icons.attach_file, size: 17),
+                        SizedBox(width: 4),
+                        Text('Attach', style: TextStyle(fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                ),
+                const Spacer(),
+                IconButton(
+                  tooltip: 'AI provider settings',
+                  onPressed: () => unawaited(_showAiSettings()),
+                  icon: Icon(
+                    _aiSettings.configured
+                        ? Icons.settings_outlined
+                        : Icons.key_outlined,
+                    size: 18,
+                  ),
+                  visualDensity: VisualDensity.compact,
+                ),
+                IconButton(
+                  tooltip: 'Clear conversation',
+                  onPressed: _aiMessages.isEmpty
+                      ? null
+                      : () => setState(_aiMessages.clear),
+                  icon: const Icon(Icons.delete_sweep_outlined, size: 18),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ],
+            ),
+          ),
+          if (_aiAttachments.isNotEmpty)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.fromLTRB(8, 7, 8, 5),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerLow,
+                border: Border(
+                  bottom: BorderSide(color: Theme.of(context).dividerColor),
+                ),
+              ),
+              child: Wrap(
+                spacing: 5,
+                runSpacing: 5,
+                children: [
+                  for (final attachment in _aiAttachments)
+                    InputChip(
+                      avatar: Icon(attachment.icon, size: 14),
+                      label: Text(
+                        attachment.label,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      labelStyle: const TextStyle(fontSize: 11),
+                      visualDensity: VisualDensity.compact,
+                      onDeleted: () =>
+                          setState(() => _aiAttachments.remove(attachment)),
+                    ),
+                ],
+              ),
+            ),
+          Expanded(
+            child: _aiMessages.isEmpty
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Text(
+                        'Attach a schema, table, script, or selection, then ask for SQL.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.all(10),
+                    itemCount: _aiMessages.length,
+                    itemBuilder: (context, index) {
+                      final message = _aiMessages[index];
+                      final sql = message.role == 'assistant'
+                          ? _sqlFromAiMessage(message.text)
+                          : null;
+                      return _AiMessageView(
+                        message: message,
+                        sql: sql,
+                        onInsert: sql == null ? null : () => _insertAiSql(sql),
+                        onNewScript: sql == null
+                            ? null
+                            : () => unawaited(_openAiSqlInNewScript(sql)),
+                      );
+                    },
+                  ),
+          ),
+          if (_aiSending) const LinearProgressIndicator(minHeight: 2),
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surface,
+              border: Border(
+                top: BorderSide(color: Theme.of(context).dividerColor),
+              ),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _aiPromptController,
+                    minLines: 1,
+                    maxLines: 5,
+                    onSubmitted: (_) => unawaited(_sendAiPrompt()),
+                    decoration: const InputDecoration(
+                      hintText: 'Ask about the attached database context',
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                IconButton.filled(
+                  tooltip: 'Send',
+                  onPressed: _aiSending
+                      ? null
+                      : () => unawaited(_sendAiPrompt()),
+                  icon: const Icon(Icons.send, size: 18),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -3088,6 +3792,367 @@ class _EditableResultReference {
   const _EditableResultReference({required this.schema, required this.table});
 }
 
+class _AiAttachment {
+  final String id;
+  final String label;
+  final IconData icon;
+  final String content;
+
+  const _AiAttachment({
+    required this.id,
+    required this.label,
+    required this.icon,
+    required this.content,
+  });
+}
+
+class _AiTableChoice {
+  final String schema;
+  final DatabaseTable table;
+
+  const _AiTableChoice({required this.schema, required this.table});
+}
+
+class _RightPanelTab extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final bool active;
+  final VoidCallback onTap;
+
+  const _RightPanelTab({
+    required this.label,
+    required this.icon,
+    required this.active,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        height: 36,
+        decoration: BoxDecoration(
+          color: active
+              ? Theme.of(context).colorScheme.surface
+              : Colors.transparent,
+          border: Border(
+            bottom: BorderSide(
+              color: active ? const Color(0xff1473a8) : Colors.transparent,
+              width: 2,
+            ),
+          ),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 15),
+            const SizedBox(width: 5),
+            Flexible(
+              child: Text(
+                label,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: active ? FontWeight.w600 : FontWeight.normal,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AiMessageView extends StatelessWidget {
+  final AiAssistantMessage message;
+  final String? sql;
+  final VoidCallback? onInsert;
+  final VoidCallback? onNewScript;
+
+  const _AiMessageView({
+    required this.message,
+    required this.sql,
+    required this.onInsert,
+    required this.onNewScript,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final assistant = message.role == 'assistant';
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(9),
+      decoration: BoxDecoration(
+        color: assistant
+            ? Theme.of(context).colorScheme.surfaceContainerLow
+            : Theme.of(context).colorScheme.primaryContainer,
+        border: Border.all(color: Theme.of(context).dividerColor),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                assistant ? Icons.auto_awesome_outlined : Icons.person_outline,
+                size: 15,
+                color: assistant
+                    ? const Color(0xff1473a8)
+                    : const Color(0xff45616f),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                assistant ? 'Assistant' : 'You',
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 7),
+          SelectableText(
+            message.text,
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.35,
+              fontFamily: sql == null ? null : 'Consolas',
+            ),
+          ),
+          if (sql != null) ...[
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                TextButton.icon(
+                  onPressed: onInsert,
+                  icon: const Icon(Icons.subdirectory_arrow_left, size: 16),
+                  label: const Text('Insert'),
+                ),
+                TextButton.icon(
+                  onPressed: onNewScript,
+                  icon: const Icon(Icons.note_add_outlined, size: 16),
+                  label: const Text('New script'),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _AiSettingsDialog extends StatefulWidget {
+  final AiAssistantSettings initial;
+
+  const _AiSettingsDialog({required this.initial});
+
+  @override
+  State<_AiSettingsDialog> createState() => _AiSettingsDialogState();
+}
+
+class _AiSettingsDialogState extends State<_AiSettingsDialog> {
+  late AiProvider _provider;
+  late final TextEditingController _openAiKeyController;
+  late final TextEditingController _copilotTokenController;
+  late final TextEditingController _modelController;
+  bool _obscureKey = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _provider = widget.initial.provider;
+    _openAiKeyController = TextEditingController(
+      text: widget.initial.openAiApiKey,
+    );
+    _copilotTokenController = TextEditingController(
+      text: widget.initial.githubCopilotToken,
+    );
+    _modelController = TextEditingController(text: widget.initial.model);
+  }
+
+  @override
+  void dispose() {
+    _openAiKeyController.dispose();
+    _copilotTokenController.dispose();
+    _modelController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('AI Provider Settings'),
+      content: SizedBox(
+        width: 430,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SegmentedButton<AiProvider>(
+              segments: const [
+                ButtonSegment(
+                  value: AiProvider.openAi,
+                  icon: Icon(Icons.key_outlined),
+                  label: Text('OpenAI'),
+                ),
+                ButtonSegment(
+                  value: AiProvider.githubCopilot,
+                  icon: Icon(Icons.code),
+                  label: Text('GitHub Copilot'),
+                ),
+              ],
+              selected: {_provider},
+              onSelectionChanged: (selection) {
+                setState(() => _provider = selection.single);
+              },
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _provider == AiProvider.openAi
+                  ? _openAiKeyController
+                  : _copilotTokenController,
+              obscureText: _obscureKey,
+              decoration: InputDecoration(
+                labelText: _provider == AiProvider.openAi
+                    ? 'OpenAI API key'
+                    : 'GitHub Copilot token',
+                helperText: _provider == AiProvider.openAi
+                    ? 'Stored in the operating system credential store.'
+                    : 'Use gho_, ghu_, or github_pat_. Requires Copilot CLI and a Copilot plan.',
+                suffixIcon: IconButton(
+                  tooltip: _obscureKey ? 'Show key' : 'Hide key',
+                  onPressed: () => setState(() => _obscureKey = !_obscureKey),
+                  icon: Icon(
+                    _obscureKey ? Icons.visibility : Icons.visibility_off,
+                  ),
+                ),
+              ),
+            ),
+            if (_provider == AiProvider.openAi) ...[
+              const SizedBox(height: 14),
+              TextField(
+                controller: _modelController,
+                decoration: const InputDecoration(
+                  labelText: 'OpenAI model',
+                  helperText: 'Default: gpt-5.4-mini',
+                ),
+              ),
+            ] else ...[
+              const SizedBox(height: 14),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Copilot will use the default model available for this '
+                  'GitHub account.',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final model = _modelController.text.trim().isEmpty
+                ? 'gpt-5.4-mini'
+                : _modelController.text.trim();
+            final copilotToken = _copilotTokenController.text.trim();
+            if (_provider == AiProvider.githubCopilot &&
+                copilotToken.startsWith('ghp_')) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text(
+                    'Classic ghp_ tokens are unsupported. Use gho_, ghu_, or github_pat_.',
+                  ),
+                ),
+              );
+              return;
+            }
+            Navigator.of(context).pop(
+              AiAssistantSettings(
+                provider: _provider,
+                openAiApiKey: _openAiKeyController.text.trim(),
+                githubCopilotToken: copilotToken,
+                model: model,
+              ),
+            );
+          },
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
+class _AiSchemaPicker extends StatelessWidget {
+  final List<DatabaseSchema> schemas;
+
+  const _AiSchemaPicker({required this.schemas});
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Attach Schema'),
+      content: SizedBox(
+        width: 420,
+        height: 360,
+        child: ListView.builder(
+          itemCount: schemas.length,
+          itemBuilder: (context, index) {
+            final schema = schemas[index];
+            return ListTile(
+              leading: const Icon(Icons.account_tree_outlined, size: 18),
+              title: Text(schema.name),
+              subtitle: Text('${schema.tables.length} loaded tables'),
+              onTap: () => Navigator.of(context).pop(schema),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _AiTablePicker extends StatelessWidget {
+  final List<_AiTableChoice> tables;
+
+  const _AiTablePicker({required this.tables});
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Attach Table'),
+      content: SizedBox(
+        width: 440,
+        height: 400,
+        child: ListView.builder(
+          itemCount: tables.length,
+          itemBuilder: (context, index) {
+            final choice = tables[index];
+            return ListTile(
+              leading: const Icon(Icons.table_chart_outlined, size: 18),
+              title: Text(choice.table.name),
+              subtitle: Text(choice.schema),
+              onTap: () => Navigator.of(context).pop(choice),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
 class _SqlResultContext {
   final String schema;
   final String table;
@@ -3101,6 +4166,8 @@ class _SqlResultContext {
 }
 
 class _OpenTableTab {
+  static const pageSize = 500;
+
   final PostgresDatabase database;
   final String connectionName;
   final String schema;
@@ -3116,6 +4183,8 @@ class _OpenTableTab {
   final Map<int, Map<int, String>> pendingChanges = {};
   List<String> resultColumns = [];
   List<List<dynamic>> rows = [];
+  bool hasMoreRows = true;
+  bool loadingPage = false;
 
   _OpenTableTab({
     required this.database,
@@ -3245,7 +4314,10 @@ class _ColumnFilterDialogState extends State<_ColumnFilterDialog> {
           children: [
             Text(
               widget.column.displayType,
-              style: const TextStyle(fontSize: 12, color: Colors.black54),
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
@@ -3425,10 +4497,12 @@ class _SqlScriptPickerDialogState extends State<_SqlScriptPickerDialog> {
               child: _isRefreshing
                   ? const Center(child: CircularProgressIndicator())
                   : _scripts.isEmpty
-                  ? const Center(
+                  ? Center(
                       child: Text(
                         'No saved scripts for this selection.',
-                        style: TextStyle(color: Colors.black54),
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
                       ),
                     )
                   : ListView.builder(
@@ -3465,6 +4539,8 @@ class _SqlScriptTab {
   final _SqlCodeController controller;
   final FocusNode focusNode = FocusNode();
   _SqlEditorError? error;
+  String? aiSuggestion;
+  bool aiCompleting = false;
 
   _SqlScriptTab({
     required this.title,
@@ -3495,6 +4571,8 @@ class _SqlCodeController extends CodeController {
   KeyEventResult Function(KeyEvent event)? completionKeyHandler;
 
   _SqlCodeController({required String text}) : super(text: text, language: sql);
+
+  void refreshCompletions() => notifyListeners();
 
   @override
   KeyEventResult onKey(KeyEvent event) {
@@ -3590,6 +4668,9 @@ class _SqlCodeEditor extends StatefulWidget {
   final _SqlCodeController controller;
   final FocusNode focusNode;
   final _SqlEditorError? error;
+  final String? aiSuggestion;
+  final VoidCallback onAcceptAiSuggestion;
+  final VoidCallback onDismissAiSuggestion;
   final List<_SqlCompletion> Function(TextEditingValue value) optionsBuilder;
   final ValueChanged<_SqlCompletion> onSelected;
 
@@ -3597,6 +4678,9 @@ class _SqlCodeEditor extends StatefulWidget {
     required this.controller,
     required this.focusNode,
     required this.error,
+    required this.aiSuggestion,
+    required this.onAcceptAiSuggestion,
+    required this.onDismissAiSuggestion,
     required this.optionsBuilder,
     required this.onSelected,
   });
@@ -3674,11 +4758,12 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
   }
 
   KeyEventResult _handleKeyEvent(KeyEvent event) {
-    if (event is! KeyDownEvent || _options.isEmpty) {
+    if (event is! KeyDownEvent) {
       return KeyEventResult.ignored;
     }
 
-    if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+    if (_options.isNotEmpty &&
+        event.logicalKey == LogicalKeyboardKey.arrowDown) {
       setState(() {
         _highlightedIndex = (_highlightedIndex + 1).clamp(
           0,
@@ -3687,7 +4772,7 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
       });
       return KeyEventResult.handled;
     }
-    if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+    if (_options.isNotEmpty && event.logicalKey == LogicalKeyboardKey.arrowUp) {
       setState(() {
         _highlightedIndex = _highlightedIndex <= 0
             ? _options.length - 1
@@ -3695,16 +4780,29 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
       });
       return KeyEventResult.handled;
     }
-    if (event.logicalKey == LogicalKeyboardKey.enter ||
-        event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+    if (_options.isNotEmpty &&
+        (event.logicalKey == LogicalKeyboardKey.enter ||
+            event.logicalKey == LogicalKeyboardKey.numpadEnter)) {
       _select(_options[_highlightedIndex < 0 ? 0 : _highlightedIndex]);
       return KeyEventResult.handled;
     }
-    if (event.logicalKey == LogicalKeyboardKey.escape) {
+    if (_options.isNotEmpty && event.logicalKey == LogicalKeyboardKey.escape) {
       setState(() {
         _options = const [];
         _highlightedIndex = -1;
       });
+      return KeyEventResult.handled;
+    }
+    if (_options.isEmpty &&
+        widget.aiSuggestion != null &&
+        event.logicalKey == LogicalKeyboardKey.tab) {
+      widget.onAcceptAiSuggestion();
+      return KeyEventResult.handled;
+    }
+    if (_options.isEmpty &&
+        widget.aiSuggestion != null &&
+        event.logicalKey == LogicalKeyboardKey.escape) {
+      widget.onDismissAiSuggestion();
       return KeyEventResult.handled;
     }
 
@@ -3747,6 +4845,7 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
 
   @override
   Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
     return LayoutBuilder(
       builder: (context, constraints) {
         final caret = _caretOffset(constraints.maxWidth);
@@ -3769,13 +4868,15 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
           children: [
             Positioned.fill(
               child: CodeTheme(
-                data: CodeThemeData(styles: githubTheme),
+                data: CodeThemeData(
+                  styles: dark ? atomOneDarkTheme : githubTheme,
+                ),
                 child: CodeField(
                   controller: widget.controller,
                   focusNode: widget.focusNode,
                   expands: true,
                   wrap: false,
-                  background: Colors.white,
+                  background: Theme.of(context).colorScheme.surface,
                   cursorColor: const Color(0xff1f6feb),
                   textStyle: _textStyle,
                   padding: const EdgeInsets.fromLTRB(10, 10, 12, 36),
@@ -3804,7 +4905,7 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
                 width: popupWidth,
                 child: Material(
                   elevation: 6,
-                  color: Colors.white,
+                  color: Theme.of(context).colorScheme.surfaceContainerHigh,
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxHeight: 240),
                     child: ListView.builder(
@@ -3820,8 +4921,8 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
                           child: Container(
                             height: 40,
                             color: highlighted
-                                ? const Color(0xffd9eaf7)
-                                : Colors.white,
+                                ? Theme.of(context).colorScheme.primaryContainer
+                                : Theme.of(context).colorScheme.surface,
                             padding: const EdgeInsets.symmetric(horizontal: 10),
                             child: Row(
                               children: [
@@ -3845,9 +4946,11 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
                                   child: Text(
                                     option.detail,
                                     overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
+                                    style: TextStyle(
                                       fontSize: 11,
-                                      color: Colors.black54,
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
                                     ),
                                   ),
                                 ),
@@ -3886,7 +4989,7 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
                     horizontal: 10,
                     vertical: 7,
                   ),
-                  color: const Color(0xffffeeee),
+                  color: Theme.of(context).colorScheme.errorContainer,
                   child: Row(
                     children: [
                       const Icon(
@@ -3899,13 +5002,72 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
                         child: Text(
                           'Line ${widget.error!.line}, column ${widget.error!.column}: ${widget.error!.message}',
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Color(0xff8a1c1c),
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onErrorContainer,
                             fontSize: 12,
                           ),
                         ),
                       ),
                     ],
+                  ),
+                ),
+              ),
+            if (widget.aiSuggestion != null)
+              Positioned(
+                left: 10,
+                right: 10,
+                bottom: widget.error == null ? 8 : 46,
+                child: Material(
+                  elevation: 3,
+                  color: Theme.of(context).colorScheme.secondaryContainer,
+                  borderRadius: BorderRadius.circular(5),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 7,
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.auto_awesome_outlined,
+                          size: 15,
+                          color: Color(0xff1473a8),
+                        ),
+                        const SizedBox(width: 7),
+                        Expanded(
+                          child: Text(
+                            widget.aiSuggestion!,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontFamily: 'Consolas',
+                              fontSize: 12,
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.onSecondaryContainer,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Tab to accept',
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Dismiss',
+                          onPressed: widget.onDismissAiSuggestion,
+                          icon: const Icon(Icons.close, size: 15),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -4077,6 +5239,7 @@ class _SchemaTreeItem extends StatefulWidget {
   final Future<void> Function(String schema) onSelectSchema;
   final VoidCallback onRefresh;
   final void Function(String name) onCopyName;
+  final VoidCallback onAddToAiContext;
   final Widget Function(DatabaseTable table) tableBuilder;
 
   const _SchemaTreeItem({
@@ -4087,6 +5250,7 @@ class _SchemaTreeItem extends StatefulWidget {
     required this.onSelectSchema,
     required this.onRefresh,
     required this.onCopyName,
+    required this.onAddToAiContext,
     required this.tableBuilder,
   });
 
@@ -4122,6 +5286,10 @@ class _SchemaTreeItemState extends State<_SchemaTreeItem> {
         PopupMenuItem(value: 'refresh', child: _MenuAction('Refresh')),
         PopupMenuItem(value: 'copy', child: _MenuAction('Copy name')),
         PopupMenuItem(
+          value: 'ai-context',
+          child: _MenuAction('Add to AI context'),
+        ),
+        PopupMenuItem(
           value: 'properties',
           child: _MenuAction('View properties'),
         ),
@@ -4137,6 +5305,9 @@ class _SchemaTreeItemState extends State<_SchemaTreeItem> {
             break;
           case 'copy':
             widget.onCopyName(widget.schema.name);
+            break;
+          case 'ai-context':
+            widget.onAddToAiContext();
             break;
         }
       },
@@ -4163,9 +5334,12 @@ class _SchemaTreeItemState extends State<_SchemaTreeItem> {
               child: Align(
                 alignment: Alignment.centerLeft,
                 child: widget.isLoading
-                    ? const Text(
+                    ? Text(
                         'Loading tables...',
-                        style: TextStyle(fontSize: 12, color: Colors.black54),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
                       )
                     : TextButton.icon(
                         onPressed: _requestLoad,
@@ -4180,17 +5354,26 @@ class _SchemaTreeItemState extends State<_SchemaTreeItem> {
               ),
             ),
           if (widget.schema.tablesLoaded && widget.schema.tables.isEmpty)
-            const Padding(
-              padding: EdgeInsets.only(left: 58, right: 8, bottom: 8),
+            Padding(
+              padding: const EdgeInsets.only(left: 58, right: 8, bottom: 8),
               child: Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
                   'No tables found.',
-                  style: TextStyle(fontSize: 12, color: Colors.black54),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
                 ),
               ),
             ),
-          for (final table in widget.schema.tables) widget.tableBuilder(table),
+          for (final table in widget.schema.tables)
+            KeyedSubtree(
+              key: ValueKey(
+                '${widget.connectionKey}.${widget.schema.name}.${table.name}',
+              ),
+              child: widget.tableBuilder(table),
+            ),
         ],
       ),
     );
@@ -4215,6 +5398,7 @@ class _TableTreeItem extends StatelessWidget {
   final Future<void> Function(String schema, DatabaseTable table)
   onOpenTableProperties;
   final void Function(String name) onCopyName;
+  final VoidCallback onAddToAiContext;
   final VoidCallback onRefresh;
 
   const _TableTreeItem({
@@ -4228,6 +5412,7 @@ class _TableTreeItem extends StatelessWidget {
     required this.onOpenTableData,
     required this.onOpenTableProperties,
     required this.onCopyName,
+    required this.onAddToAiContext,
     required this.onRefresh,
   });
 
@@ -4243,6 +5428,10 @@ class _TableTreeItem extends StatelessWidget {
         PopupMenuItem(value: 'delete', child: _MenuAction('  DELETE')),
         PopupMenuItem(value: 'refresh', child: _MenuAction('Refresh')),
         PopupMenuItem(value: 'copy', child: _MenuAction('Copy name')),
+        PopupMenuItem(
+          value: 'ai-context',
+          child: _MenuAction('Add to AI context'),
+        ),
         PopupMenuItem(
           value: 'properties',
           child: _MenuAction('View properties'),
@@ -4264,6 +5453,9 @@ class _TableTreeItem extends StatelessWidget {
             break;
           case 'copy':
             onCopyName(table.name);
+            break;
+          case 'ai-context':
+            onAddToAiContext();
             break;
           case 'properties':
             unawaited(onOpenTableProperties(schema, table));
@@ -4321,21 +5513,28 @@ class _TableTreeItem extends StatelessWidget {
                       isLoading
                           ? 'Loading columns...'
                           : 'Loading column metadata...',
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 12,
-                        color: Colors.black54,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
                     ),
                   ),
                 )
               else if (table.columns.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.only(left: 116, right: 8, bottom: 8),
+                Padding(
+                  padding: const EdgeInsets.only(
+                    left: 116,
+                    right: 8,
+                    bottom: 8,
+                  ),
                   child: Align(
                     alignment: Alignment.centerLeft,
                     child: Text(
                       'No columns found.',
-                      style: TextStyle(fontSize: 12, color: Colors.black54),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
                     ),
                   ),
                 ),
@@ -4444,7 +5643,10 @@ class _TableMetadataFolder extends StatelessWidget {
                     : isLoading
                     ? 'Loading metadata...'
                     : 'Loading metadata...',
-                style: const TextStyle(fontSize: 12, color: Colors.black54),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
               ),
             ),
           )
@@ -4477,7 +5679,9 @@ class _HoverTitleState extends State<_HoverTitle> {
         duration: const Duration(milliseconds: 80),
         padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
         decoration: BoxDecoration(
-          color: _hovering ? const Color(0xffe8f1fb) : Colors.transparent,
+          color: _hovering
+              ? Theme.of(context).colorScheme.primaryContainer
+              : Colors.transparent,
           borderRadius: BorderRadius.circular(4),
         ),
         child: widget.child,
@@ -4543,6 +5747,9 @@ class _TableDataBrowserBar extends StatelessWidget {
   final VoidCallback onClose;
   final bool hasChanges;
   final bool canEdit;
+  final int loadedRows;
+  final bool hasMoreRows;
+  final bool loadingMore;
   final VoidCallback onSaveChanges;
   final VoidCallback onCancelChanges;
 
@@ -4556,6 +5763,9 @@ class _TableDataBrowserBar extends StatelessWidget {
     required this.onClose,
     required this.hasChanges,
     required this.canEdit,
+    required this.loadedRows,
+    required this.hasMoreRows,
+    required this.loadingMore,
     required this.onSaveChanges,
     required this.onCancelChanges,
   });
@@ -4564,7 +5774,7 @@ class _TableDataBrowserBar extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       height: 42,
-      color: const Color(0xfff7f7f7),
+      color: Theme.of(context).colorScheme.surfaceContainer,
       padding: const EdgeInsets.symmetric(horizontal: 8),
       child: Row(
         children: [
@@ -4598,6 +5808,18 @@ class _TableDataBrowserBar extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 8),
+          Text(
+            loadingMore
+                ? '$loadedRows rows, loading...'
+                : hasMoreRows
+                ? '$loadedRows rows loaded'
+                : '$loadedRows rows',
+            style: TextStyle(
+              fontSize: 11,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(width: 4),
           IconButton(
             tooltip: canEdit
                 ? 'Save row changes'
@@ -4653,7 +5875,7 @@ class _TablePropertiesView extends StatelessWidget {
       children: [
         Container(
           height: 36,
-          color: const Color(0xfff7f7f7),
+          color: Theme.of(context).colorScheme.surfaceContainer,
           padding: const EdgeInsets.symmetric(horizontal: 10),
           alignment: Alignment.centerLeft,
           child: Text(
@@ -4671,12 +5893,14 @@ class _TablePropertiesView extends StatelessWidget {
               children: [
                 Container(
                   height: 32,
-                  color: const Color(0xffefefef),
-                  child: const TabBar(
-                    labelColor: Colors.black87,
-                    unselectedLabelColor: Colors.black54,
-                    indicatorColor: Colors.blueGrey,
-                    tabs: [
+                  color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                  child: TabBar(
+                    labelColor: Theme.of(context).colorScheme.onSurface,
+                    unselectedLabelColor: Theme.of(
+                      context,
+                    ).colorScheme.onSurfaceVariant,
+                    indicatorColor: Theme.of(context).colorScheme.primary,
+                    tabs: const [
                       Tab(text: 'Columns'),
                       Tab(text: 'DDL'),
                     ],
@@ -4697,7 +5921,7 @@ class _TablePropertiesView extends StatelessWidget {
                         ],
                       ),
                       Container(
-                        color: Colors.white,
+                        color: Theme.of(context).colorScheme.surface,
                         padding: const EdgeInsets.all(12),
                         alignment: Alignment.topLeft,
                         child: SelectableText(
@@ -4726,10 +5950,10 @@ class _TableDiagramPlaceholder extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Center(
+    return Center(
       child: Text(
         'Diagram view placeholder',
-        style: TextStyle(color: Colors.black54),
+        style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
       ),
     );
   }

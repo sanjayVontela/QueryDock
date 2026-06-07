@@ -2,17 +2,17 @@ import 'package:bitsdojo_window/bitsdojo_window.dart';
 import 'package:flutter/material.dart';
 import 'app.dart';
 import 'services/crash_reporter.dart';
+import 'services/theme_controller.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   CrashReporter.install();
+  await AppThemeController.load();
 
   doWhenWindowReady(() {
-    const initialSize = Size(1280, 720);
-    appWindow.minSize = const Size(300, 300);
-    appWindow.size = initialSize;
-    appWindow.alignment = Alignment.center;
-    appWindow.title = 'DB Viewer';
+    appWindow.minSize = const Size(900, 600);
+    appWindow.title = 'QueryDock';
+    appWindow.maximize();
     appWindow.show();
   });
 

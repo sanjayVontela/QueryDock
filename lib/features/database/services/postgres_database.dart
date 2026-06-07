@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -209,6 +210,7 @@ class SecureConnectionSecretStore implements ConnectionSecretStore {
 class PostgresQueryResult {
   final List<String> columns;
   final List<List<dynamic>> rows;
+  final int rowCount;
   final int affectedRows;
   final Duration elapsed;
   final bool rowLimitApplied;
@@ -216,10 +218,11 @@ class PostgresQueryResult {
   const PostgresQueryResult({
     required this.columns,
     required this.rows,
+    int? rowCount,
     required this.affectedRows,
     required this.elapsed,
     this.rowLimitApplied = false,
-  });
+  }) : rowCount = rowCount ?? rows.length;
 }
 
 class PostgresQueryException implements Exception {
@@ -269,52 +272,55 @@ class PostgresRowConflictException implements Exception {
 class PostgresDatabase {
   static const int defaultMaxRows = 10000;
   static const int defaultChunkSize = 500;
+  static const schemaRelationsSql = '''
+SELECT c.relname
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = @schema
+  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+ORDER BY c.relname;
+''';
 
   final PostgresConnectionConfig config;
-  final Connection _connection;
-  final int _backendPid;
-  Connection? _controlConnection;
+  final Pool<void> _pool;
+  int? _activeBackendPid;
   bool _queryRunning = false;
   final List<DatabaseSchema> _schemaCache = [];
   final Map<String, List<DatabaseTable>> _tableCache = {};
   final Map<String, DatabaseTable> _tableDetailCache = {};
 
-  PostgresDatabase._({
-    required this.config,
-    required Connection connection,
-    required int backendPid,
-  }) : _connection = connection,
-       _backendPid = backendPid;
+  PostgresDatabase._({required this.config, required Pool<void> pool})
+    : _pool = pool;
 
   static Future<PostgresDatabase> connect(
     PostgresConnectionConfig config,
   ) async {
-    final connection = await _openConnection(config);
-    final pidResult = await connection.execute('SELECT pg_backend_pid();');
-    final backendPid = pidResult.first[0] as int;
-
-    return PostgresDatabase._(
-      config: config,
-      connection: connection,
-      backendPid: backendPid,
-    );
-  }
-
-  static Future<Connection> _openConnection(PostgresConnectionConfig config) {
-    return Connection.open(
-      Endpoint(
-        host: config.host,
-        port: config.port,
-        database: config.database,
-        username: config.username,
-        password: config.password.isEmpty ? null : config.password,
-      ),
-      settings: ConnectionSettings(
-        applicationName: 'DB Viewer',
+    final pool = Pool<void>.withEndpoints(
+      [_endpoint(config)],
+      settings: PoolSettings(
+        maxConnectionCount: 4,
+        maxConnectionAge: const Duration(minutes: 30),
+        maxSessionUse: const Duration(minutes: 10),
+        maxQueryCount: 1000,
+        applicationName: 'QueryDock',
         connectTimeout: const Duration(seconds: 10),
         queryTimeout: const Duration(minutes: 5),
         sslMode: config.sslMode,
       ),
+    );
+    await pool.withConnection(
+      (connection) => connection.execute('SELECT 1;', ignoreRows: true),
+    );
+    return PostgresDatabase._(config: config, pool: pool);
+  }
+
+  static Endpoint _endpoint(PostgresConnectionConfig config) {
+    return Endpoint(
+      host: config.host,
+      port: config.port,
+      database: config.database,
+      username: config.username,
+      password: config.password.isEmpty ? null : config.password,
     );
   }
 
@@ -329,7 +335,7 @@ class PostgresDatabase {
       _tableDetailCache.clear();
     }
 
-    final schemaResult = await _connection.execute('''
+    final schemaResult = await _pool.execute('''
 SELECT schema_name
 FROM information_schema.schemata
 WHERE schema_name <> 'information_schema'
@@ -363,14 +369,8 @@ ORDER BY schema_name;
       _tableDetailCache.removeWhere((key, value) => key.startsWith('$schema.'));
     }
 
-    final tableResult = await _connection.execute(
-      Sql.named('''
-SELECT table_name
-FROM information_schema.tables
-WHERE table_schema = @schema
-  AND table_type = 'BASE TABLE'
-ORDER BY table_name;
-'''),
+    final tableResult = await _pool.execute(
+      Sql.named(schemaRelationsSql),
       parameters: {'schema': schema},
     );
 
@@ -399,11 +399,10 @@ ORDER BY table_name;
       return cached;
     }
 
-    final columnResult = await _connection.execute(
+    final metadataResult = await _pool.execute(
       Sql.named('''
-SELECT c.table_schema,
-       c.table_name,
-       c.column_name,
+SELECT 'column' AS kind,
+       c.column_name AS name,
        COALESCE(
          CASE
            WHEN c.data_type IN ('character varying', 'character', 'bit varying', 'bit')
@@ -415,23 +414,14 @@ SELECT c.table_schema,
            ELSE c.data_type
          END,
          c.udt_name
-       ) AS display_type,
-       c.is_nullable
+       ) AS detail,
+       c.is_nullable AS extra,
+       c.ordinal_position AS sort_order
 FROM information_schema.columns c
-JOIN information_schema.tables t
-  ON t.table_schema = c.table_schema
- AND t.table_name = c.table_name
- AND t.table_type = 'BASE TABLE'
 WHERE c.table_schema = @schema
   AND c.table_name = @table
-ORDER BY c.table_schema, c.table_name, c.ordinal_position;
-'''),
-      parameters: {'schema': schema, 'table': table},
-    );
-
-    final primaryKeyResult = await _connection.execute(
-      Sql.named('''
-SELECT kcu.column_name
+UNION ALL
+SELECT 'primary-key', kcu.column_name, '', '', 100000 + kcu.ordinal_position
 FROM information_schema.table_constraints tc
 JOIN information_schema.key_column_usage kcu
   ON kcu.constraint_name = tc.constraint_name
@@ -439,62 +429,22 @@ JOIN information_schema.key_column_usage kcu
 WHERE tc.table_schema = @schema
   AND tc.table_name = @table
   AND tc.constraint_type = 'PRIMARY KEY'
-ORDER BY kcu.ordinal_position;
-'''),
-      parameters: {'schema': schema, 'table': table},
-    );
-    final primaryKeys = {
-      for (final row in primaryKeyResult) row[0]?.toString() ?? '',
-    };
-
-    final columns = <DatabaseColumn>[];
-    for (final row in columnResult) {
-      final column = row[2]?.toString() ?? '';
-      final type = row[3]?.toString() ?? 'unknown';
-      final nullable = row[4]?.toString() == 'YES';
-      if (column.isEmpty) continue;
-
-      columns.add(
-        DatabaseColumn(
-          name: column,
-          dataType: type,
-          nullable: nullable,
-          primaryKey: primaryKeys.contains(column),
-        ),
-      );
-    }
-
-    final constraintResult = await _connection.execute(
-      Sql.named('''
-SELECT constraint_name, constraint_type
+UNION ALL
+SELECT 'constraint', constraint_name, constraint_type, '', 200000
 FROM information_schema.table_constraints
 WHERE table_schema = @schema
   AND table_name = @table
-ORDER BY constraint_type, constraint_name;
-'''),
-      parameters: {'schema': schema, 'table': table},
-    );
-    final constraints = [
-      for (final row in constraintResult) '${row[0]}  [${row[1]}]',
-    ];
-
-    final indexResult = await _connection.execute(
-      Sql.named('''
-SELECT indexname
+UNION ALL
+SELECT 'index', indexname, '', '', 300000
 FROM pg_indexes
 WHERE schemaname = @schema
   AND tablename = @table
-ORDER BY indexname;
-'''),
-      parameters: {'schema': schema, 'table': table},
-    );
-    final indexes = [for (final row in indexResult) row[0]?.toString() ?? ''];
-
-    final foreignKeyResult = await _connection.execute(
-      Sql.named('''
-SELECT tc.constraint_name,
-       ccu.table_schema,
-       ccu.table_name
+UNION ALL
+SELECT 'foreign-key',
+       tc.constraint_name,
+       ccu.table_schema || '.' || ccu.table_name,
+       '',
+       400000
 FROM information_schema.table_constraints tc
 JOIN information_schema.constraint_column_usage ccu
   ON ccu.constraint_name = tc.constraint_name
@@ -502,26 +452,54 @@ JOIN information_schema.constraint_column_usage ccu
 WHERE tc.table_schema = @schema
   AND tc.table_name = @table
   AND tc.constraint_type = 'FOREIGN KEY'
-ORDER BY tc.constraint_name;
-'''),
-      parameters: {'schema': schema, 'table': table},
-    );
-    final foreignKeys = [
-      for (final row in foreignKeyResult) '${row[0]}  -> ${row[1]}.${row[2]}',
-    ];
-
-    final triggerResult = await _connection.execute(
-      Sql.named('''
-SELECT trigger_name, event_manipulation
+UNION ALL
+SELECT 'trigger', trigger_name, event_manipulation, '', 500000
 FROM information_schema.triggers
 WHERE event_object_schema = @schema
   AND event_object_table = @table
-ORDER BY trigger_name, event_manipulation;
+ORDER BY sort_order, name;
 '''),
       parameters: {'schema': schema, 'table': table},
     );
-    final triggers = [
-      for (final row in triggerResult) '${row[0]}  [${row[1]}]',
+
+    final primaryKeys = <String>{};
+    final rawColumns = <({String name, String type, bool nullable})>[];
+    final constraints = <String>[];
+    final indexes = <String>[];
+    final foreignKeys = <String>[];
+    final triggers = <String>[];
+    for (final row in metadataResult) {
+      final kind = row[0]?.toString() ?? '';
+      final name = row[1]?.toString() ?? '';
+      final detail = row[2]?.toString() ?? '';
+      final extra = row[3]?.toString() ?? '';
+      switch (kind) {
+        case 'column':
+          rawColumns.add((
+            name: name,
+            type: detail.isEmpty ? 'unknown' : detail,
+            nullable: extra == 'YES',
+          ));
+        case 'primary-key':
+          primaryKeys.add(name);
+        case 'constraint':
+          constraints.add('$name  [$detail]');
+        case 'index':
+          indexes.add(name);
+        case 'foreign-key':
+          foreignKeys.add('$name  -> $detail');
+        case 'trigger':
+          triggers.add('$name  [$detail]');
+      }
+    }
+    final columns = [
+      for (final column in rawColumns)
+        DatabaseColumn(
+          name: column.name,
+          dataType: column.type,
+          nullable: column.nullable,
+          primaryKey: primaryKeys.contains(column.name),
+        ),
     ];
 
     final loadedTable = DatabaseTable(
@@ -530,7 +508,7 @@ ORDER BY trigger_name, event_manipulation;
       ddl: _buildCreateTableDdl(schema, table, columns),
       columnsLoaded: true,
       constraints: constraints,
-      indexes: indexes.where((item) => item.isNotEmpty).toList(),
+      indexes: indexes,
       foreignKeys: foreignKeys,
       triggers: triggers,
     );
@@ -548,10 +526,72 @@ ORDER BY trigger_name, event_manipulation;
   }) async {
     final stopwatch = Stopwatch()..start();
     final effectiveSql = _limitReadQuery(sql, maxRows);
-    late final Result result;
     _queryRunning = true;
     try {
-      result = await _connection.execute(effectiveSql.sql);
+      return await _pool.withConnection((connection) async {
+        final pidResult = await connection.execute('SELECT pg_backend_pid();');
+        _activeBackendPid = pidResult.first[0] as int;
+        final statement = await connection.prepare(effectiveSql.sql);
+        try {
+          final retainRows = onRowsChunk == null;
+          final rows = <List<dynamic>>[];
+          final chunk = <List<dynamic>>[];
+          var rowCount = 0;
+          final completed = Completer<void>();
+          final stream = statement.bind(null);
+          late final ResultStreamSubscription subscription;
+          subscription = stream.listen(
+            (row) {
+              final values = [for (final value in row) value];
+              rowCount++;
+              if (retainRows) rows.add(values);
+              chunk.add(values);
+              if (chunk.length >= chunkSize) {
+                onRowsChunk?.call(List<List<dynamic>>.of(chunk));
+                chunk.clear();
+              }
+            },
+            onError: completed.completeError,
+            onDone: completed.complete,
+            cancelOnError: true,
+          );
+          subscription.pause();
+          final schema = await subscription.schema;
+          final columns = [
+            for (final (index, column) in schema.columns.indexed)
+              _columnName(column.columnName, index),
+          ];
+          onColumns?.call(columns);
+          subscription.resume();
+          await completed.future;
+          if (chunk.isNotEmpty) {
+            onRowsChunk?.call(List<List<dynamic>>.of(chunk));
+          }
+          final affectedRows = await subscription.affectedRows;
+          stopwatch.stop();
+
+          if (columns.isEmpty) {
+            return PostgresQueryResult(
+              columns: const ['Affected Rows'],
+              rows: [
+                [affectedRows],
+              ],
+              affectedRows: affectedRows,
+              elapsed: stopwatch.elapsed,
+            );
+          }
+          return PostgresQueryResult(
+            columns: columns,
+            rows: rows,
+            rowCount: rowCount,
+            affectedRows: affectedRows,
+            elapsed: stopwatch.elapsed,
+            rowLimitApplied: effectiveSql.limited,
+          );
+        } finally {
+          await statement.dispose();
+        }
+      });
     } on ServerException catch (error) {
       final position = error.position;
       throw PostgresQueryException(
@@ -562,57 +602,14 @@ ORDER BY trigger_name, event_manipulation;
       );
     } finally {
       _queryRunning = false;
+      _activeBackendPid = null;
     }
-    stopwatch.stop();
-
-    final columns = [
-      for (final (index, column) in result.schema.columns.indexed)
-        _columnName(column.columnName, index),
-    ];
-    onColumns?.call(columns);
-
-    if (columns.isEmpty) {
-      return PostgresQueryResult(
-        columns: const ['Affected Rows'],
-        rows: [
-          [result.affectedRows],
-        ],
-        affectedRows: result.affectedRows,
-        elapsed: stopwatch.elapsed,
-        rowLimitApplied: false,
-      );
-    }
-
-    final rows = <List<dynamic>>[];
-    final chunk = <List<dynamic>>[];
-    for (final row in result) {
-      final values = [for (final value in row) value];
-      rows.add(values);
-      chunk.add(values);
-      if (chunk.length >= chunkSize) {
-        onRowsChunk?.call(List<List<dynamic>>.of(chunk));
-        chunk.clear();
-        await Future<void>.delayed(Duration.zero);
-      }
-    }
-
-    if (chunk.isNotEmpty) {
-      onRowsChunk?.call(List<List<dynamic>>.of(chunk));
-    }
-
-    return PostgresQueryResult(
-      columns: columns,
-      rows: rows,
-      affectedRows: result.affectedRows,
-      elapsed: stopwatch.elapsed,
-      rowLimitApplied: effectiveSql.limited,
-    );
   }
 
   Future<int> updateRows(List<PostgresRowUpdate> updates) async {
     if (updates.isEmpty) return 0;
 
-    return _connection.runTx((session) async {
+    return _pool.runTx((session) async {
       var totalAffected = 0;
       for (final update in updates) {
         final parameters = <String, Object?>{};
@@ -667,18 +664,17 @@ ORDER BY trigger_name, event_manipulation;
   }
 
   Future<bool> cancelCurrentQuery() async {
-    if (!_queryRunning) return false;
-    final control = _controlConnection ??= await _openConnection(config);
-    final result = await control.execute(
+    final backendPid = _activeBackendPid;
+    if (!_queryRunning || backendPid == null) return false;
+    final result = await _pool.execute(
       Sql.named('SELECT pg_cancel_backend(@pid);'),
-      parameters: {'pid': _backendPid},
+      parameters: {'pid': backendPid},
     );
     return result.isNotEmpty && result.first[0] == true;
   }
 
   Future<void> close() async {
-    await _controlConnection?.close();
-    await _connection.close();
+    await _pool.close();
   }
 
   static String _columnName(String? name, int index) {

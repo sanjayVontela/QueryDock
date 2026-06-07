@@ -4,6 +4,38 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
+namespace {
+
+bool IsRepeatedModifierKeyDown(UINT message, WPARAM key, LPARAM flags) {
+  if (message != WM_KEYDOWN && message != WM_SYSKEYDOWN) {
+    return false;
+  }
+
+  const bool was_previously_down = (flags & (1LL << 30)) != 0;
+  if (!was_previously_down) {
+    return false;
+  }
+
+  switch (key) {
+    case VK_MENU:
+    case VK_LMENU:
+    case VK_RMENU:
+    case VK_CONTROL:
+    case VK_LCONTROL:
+    case VK_RCONTROL:
+    case VK_SHIFT:
+    case VK_LSHIFT:
+    case VK_RSHIFT:
+    case VK_LWIN:
+    case VK_RWIN:
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
@@ -51,6 +83,13 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  // Windows may emit auto-repeat messages for a held modifier. Some Flutter
+  // engine versions classify those as another KeyDownEvent instead of a
+  // KeyRepeatEvent, which violates HardwareKeyboard's state invariant.
+  if (IsRepeatedModifierKeyDown(message, wparam, lparam)) {
+    return 0;
+  }
+
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =
