@@ -1,5 +1,6 @@
 import 'package:bitsdojo_window/bitsdojo_window.dart';
 import 'package:flutter/material.dart';
+import 'package:pluto_grid/pluto_grid.dart';
 import 'package:postgres/postgres.dart';
 
 import '../../database/services/postgres_database.dart';
@@ -29,7 +30,12 @@ class AppTitleBar extends StatelessWidget {
       child: Row(
         children: [
           const SizedBox(width: 12),
-          const Icon(Icons.storage, color: Color(0xff8ab4f8), size: 18),
+          Image.asset(
+            'assets/branding/querydock_logo.png',
+            width: 20,
+            height: 20,
+            filterQuality: FilterQuality.medium,
+          ),
           const SizedBox(width: 8),
           const Text(
             'QueryDock',
@@ -993,6 +999,8 @@ class ResultTab extends StatelessWidget {
   }
 }
 
+enum ResultGridRenderer { queryDock, pluto }
+
 class ResultGrid extends StatefulWidget {
   final List<String> columns;
   final List<List<dynamic>> rows;
@@ -1009,6 +1017,7 @@ class ResultGrid extends StatefulWidget {
   final Future<void> Function()? onLoadMore;
   final bool hasMoreRows;
   final bool loadingMore;
+  final ResultGridRenderer renderer;
 
   const ResultGrid({
     super.key,
@@ -1027,6 +1036,7 @@ class ResultGrid extends StatefulWidget {
     this.onLoadMore,
     this.hasMoreRows = false,
     this.loadingMore = false,
+    this.renderer = ResultGridRenderer.queryDock,
   });
 
   @override
@@ -1179,6 +1189,10 @@ class _ResultGridState extends State<ResultGrid> {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.renderer == ResultGridRenderer.pluto) {
+      return _PlutoResultGrid(result: widget);
+    }
+
     if (widget.columns.isEmpty) {
       return Center(
         child: Text(
@@ -1390,6 +1404,348 @@ class _ResultGridState extends State<ResultGrid> {
   }
 }
 
+class _PlutoResultGrid extends StatefulWidget {
+  final ResultGrid result;
+
+  const _PlutoResultGrid({required this.result});
+
+  @override
+  State<_PlutoResultGrid> createState() => _PlutoResultGridState();
+}
+
+class _PlutoResultGridState extends State<_PlutoResultGrid> {
+  PlutoGridStateManager? _stateManager;
+  ScrollController? _verticalController;
+  late List<PlutoColumn> _columns;
+  late List<PlutoRow> _rows;
+  late List<int> _sourceSignatures;
+  bool _loadRequested = false;
+  int _gridGeneration = 0;
+
+  ResultGrid get result => widget.result;
+
+  @override
+  void initState() {
+    super.initState();
+    _rebuildModel();
+  }
+
+  @override
+  void didUpdateWidget(covariant _PlutoResultGrid oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_sameColumns(oldWidget.result.columns, result.columns)) {
+      _detachScrollController();
+      _stateManager = null;
+      _gridGeneration++;
+      _rebuildModel();
+      return;
+    }
+    if (!result.loadingMore) _loadRequested = false;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _syncRows());
+  }
+
+  @override
+  void dispose() {
+    _detachScrollController();
+    super.dispose();
+  }
+
+  bool _sameColumns(List<String> left, List<String> right) {
+    if (left.length != right.length) return false;
+    for (var index = 0; index < left.length; index++) {
+      if (left[index] != right[index]) return false;
+    }
+    return true;
+  }
+
+  void _rebuildModel() {
+    _columns = _buildColumns();
+    _rows = _buildRows();
+    _sourceSignatures = _buildSourceSignatures();
+  }
+
+  List<PlutoColumn> _buildColumns() {
+    return [
+      for (var index = 0; index < result.columns.length; index++)
+        PlutoColumn(
+          title: result.columns[index],
+          field: _field(index),
+          type: PlutoColumnType.text(),
+          width: 150,
+          minWidth: 80,
+          readOnly:
+              !result.editable || !(result.columnEditable?.call(index) ?? true),
+          enableEditingMode:
+              result.editable && (result.columnEditable?.call(index) ?? true),
+          enableSorting: result.onSortColumn != null,
+          enableColumnDrag: true,
+          enableDropToResize: true,
+          enableContextMenu: true,
+          enableFilterMenuItem: false,
+          sort: result.sortColumn == result.columns[index]
+              ? (result.sortAscending
+                    ? PlutoColumnSort.ascending
+                    : PlutoColumnSort.descending)
+              : PlutoColumnSort.none,
+          titleSpan: TextSpan(
+            children: [
+              TextSpan(text: result.columns[index]),
+              if (result.onFilterColumn != null)
+                WidgetSpan(
+                  alignment: PlaceholderAlignment.middle,
+                  child: Tooltip(
+                    message: 'Filter ${result.columns[index]}',
+                    child: InkResponse(
+                      radius: 14,
+                      onTap: () =>
+                          result.onFilterColumn!(result.columns[index]),
+                      child: Padding(
+                        padding: const EdgeInsets.only(left: 5),
+                        child: Icon(
+                          result.filteredColumns.contains(result.columns[index])
+                              ? Icons.filter_alt
+                              : Icons.filter_alt_outlined,
+                          size: 14,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          renderer: (rendererContext) {
+            final row = rendererContext.row.sortIdx;
+            final edited = result.cellEdited?.call(row, index) ?? false;
+            final value = rendererContext.cell.value?.toString() ?? 'NULL';
+            return RepaintBoundary(
+              child: Tooltip(
+                message: value,
+                waitDuration: const Duration(seconds: 2),
+                child: Container(
+                  color: edited
+                      ? Theme.of(context).colorScheme.tertiaryContainer
+                      : Colors.transparent,
+                  alignment: Alignment.centerLeft,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Text(
+                    value,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontFamily: 'Consolas',
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+    ];
+  }
+
+  List<PlutoRow> _buildRows({int start = 0}) {
+    return [
+      for (var row = start; row < result.rows.length; row++)
+        PlutoRow(
+          sortIdx: row,
+          cells: {
+            for (var column = 0; column < result.columns.length; column++)
+              _field(column): PlutoCell(value: _cellValue(row, column)),
+          },
+        ),
+    ];
+  }
+
+  String _cellValue(int row, int column) {
+    final customValue = result.cellValue?.call(row, column);
+    if (customValue != null) return customValue;
+    final sourceRow = result.rows[row];
+    if (column >= sourceRow.length) return '';
+    return sourceRow[column]?.toString() ?? 'NULL';
+  }
+
+  String _field(int column) => 'querydock_column_$column';
+
+  int _columnIndex(String field) {
+    return int.tryParse(field.substring(field.lastIndexOf('_') + 1)) ?? 0;
+  }
+
+  List<int> _buildSourceSignatures() {
+    return [for (final row in result.rows) Object.hashAll(row)];
+  }
+
+  void _onLoaded(PlutoGridOnLoadedEvent event) {
+    _stateManager = event.stateManager;
+    event.stateManager
+      ..setSortOnlyEvent(true)
+      ..setFilterOnlyEvent(true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _stateManager != event.stateManager) return;
+      _attachScrollController(event.stateManager.scroll.bodyRowsVertical);
+    });
+  }
+
+  void _attachScrollController(ScrollController? controller) {
+    if (identical(_verticalController, controller)) return;
+    _detachScrollController();
+    _verticalController = controller;
+    _verticalController?.addListener(_handleVerticalScroll);
+  }
+
+  void _detachScrollController() {
+    _verticalController?.removeListener(_handleVerticalScroll);
+    _verticalController = null;
+  }
+
+  void _handleVerticalScroll() {
+    final controller = _verticalController;
+    if (controller == null ||
+        !controller.hasClients ||
+        controller.position.extentAfter > 240 ||
+        !result.hasMoreRows ||
+        result.loadingMore ||
+        _loadRequested ||
+        result.onLoadMore == null) {
+      return;
+    }
+    _loadRequested = true;
+    result.onLoadMore!().whenComplete(() {
+      if (mounted) _loadRequested = false;
+    });
+  }
+
+  void _syncRows() {
+    final manager = _stateManager;
+    if (!mounted || manager == null) return;
+
+    final nextSignatures = _buildSourceSignatures();
+    final isAppend =
+        nextSignatures.length >= _sourceSignatures.length &&
+        _sourceSignatures.indexed.every(
+          (entry) => nextSignatures[entry.$1] == entry.$2,
+        );
+
+    if (!isAppend) {
+      manager.removeAllRows(notify: false);
+      manager.appendRows(_buildRows());
+    } else if (nextSignatures.length > _sourceSignatures.length) {
+      manager.appendRows(_buildRows(start: _sourceSignatures.length));
+    }
+
+    var valuesChanged = false;
+    final managedRows = manager.refRows.originalList;
+    final rowCount = managedRows.length < result.rows.length
+        ? managedRows.length
+        : result.rows.length;
+    for (var row = 0; row < rowCount; row++) {
+      managedRows[row].sortIdx = row;
+      for (var column = 0; column < result.columns.length; column++) {
+        final cell = managedRows[row].cells[_field(column)];
+        final value = _cellValue(row, column);
+        if (cell != null && cell.value != value) {
+          cell.value = value;
+          valuesChanged = true;
+        }
+      }
+    }
+    if (valuesChanged) manager.notifyListeners();
+
+    _sourceSignatures = nextSignatures;
+  }
+
+  PlutoGridConfiguration _configuration(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final divider = Theme.of(context).dividerColor;
+    return PlutoGridConfiguration(
+      enterKeyAction: PlutoGridEnterKeyAction.editingAndMoveDown,
+      style: PlutoGridStyleConfig(
+        enableGridBorderShadow: false,
+        gridBackgroundColor: scheme.surface,
+        rowColor: scheme.surface,
+        oddRowColor: scheme.surface,
+        evenRowColor: scheme.surfaceContainerLowest,
+        activatedColor: scheme.primaryContainer,
+        checkedColor: scheme.secondaryContainer,
+        cellColorInEditState: scheme.surface,
+        cellColorInReadOnlyState: scheme.surface,
+        iconColor: scheme.onSurfaceVariant,
+        disabledIconColor: scheme.onSurfaceVariant.withValues(alpha: 0.35),
+        menuBackgroundColor: scheme.surfaceContainer,
+        gridBorderColor: divider,
+        borderColor: divider,
+        activatedBorderColor: scheme.primary,
+        inactivatedBorderColor: divider,
+        rowHeight: 32,
+        columnHeight: 34,
+        columnTextStyle: TextStyle(
+          color: scheme.onSurface,
+          fontSize: 12,
+          fontWeight: FontWeight.w600,
+        ),
+        cellTextStyle: TextStyle(
+          color: scheme.onSurface,
+          fontFamily: 'Consolas',
+          fontSize: 12,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (result.columns.isEmpty) {
+      return Center(
+        child: Text(
+          'No results yet. Click New Connection, then Execute.',
+          style: TextStyle(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+        ),
+      );
+    }
+
+    return Stack(
+      children: [
+        PlutoGrid(
+          key: ValueKey('pluto-result-grid-$_gridGeneration'),
+          columns: _columns,
+          rows: _rows,
+          onLoaded: _onLoaded,
+          onChanged: (event) {
+            final row = event.row.sortIdx;
+            final column = _columnIndex(event.column.field);
+            result.onCellChanged?.call(
+              row,
+              column,
+              event.value?.toString() ?? '',
+            );
+          },
+          onSorted: (event) {
+            result.onSortColumn?.call(event.column.title);
+          },
+          noRowsWidget: Center(
+            child: Text(
+              'No rows',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+          configuration: _configuration(context),
+        ),
+        if (result.loadingMore)
+          const Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: LinearProgressIndicator(minHeight: 2),
+          ),
+      ],
+    );
+  }
+}
+
 class _EditableGridCell extends StatefulWidget {
   final String text;
   final double width;
@@ -1513,7 +1869,7 @@ class _FastGridCell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
+    final cell = GestureDetector(
       behavior: HitTestBehavior.opaque,
       onDoubleTap: onDoubleTap,
       child: Container(
@@ -1594,6 +1950,12 @@ class _FastGridCell extends StatelessWidget {
                 ),
               ),
       ),
+    );
+    if (header) return cell;
+    return Tooltip(
+      message: text,
+      waitDuration: const Duration(seconds: 2),
+      child: cell,
     );
   }
 }

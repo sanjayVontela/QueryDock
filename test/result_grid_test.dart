@@ -99,4 +99,108 @@ void main() {
     expect(find.byType(TextField), findsOneWidget);
     await tester.pump(const Duration(milliseconds: 400));
   });
+
+  testWidgets('Pluto renderer displays rows and invokes column filters', (
+    tester,
+  ) async {
+    String? filteredColumn;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 700,
+            height: 320,
+            child: ResultGrid(
+              renderer: ResultGridRenderer.pluto,
+              columns: const ['id', 'name'],
+              rows: const [
+                [1, 'Ada'],
+                [2, 'Grace'],
+              ],
+              onFilterColumn: (column) async {
+                filteredColumn = column;
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Ada'), findsOneWidget);
+    expect(find.text('Grace'), findsOneWidget);
+    await tester.tap(find.byTooltip('Filter name'));
+    await tester.pump();
+    expect(filteredColumn, 'name');
+  });
+
+  testWidgets('Pluto renderer reports edited cells using source indexes', (
+    tester,
+  ) async {
+    (int, int, String)? edit;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 700,
+            height: 320,
+            child: ResultGrid(
+              renderer: ResultGridRenderer.pluto,
+              columns: const ['id', 'name'],
+              rows: const [
+                [1, 'Ada'],
+                [2, 'Grace'],
+              ],
+              editable: true,
+              onCellChanged: (row, column, value) {
+                edit = (row, column, value);
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Grace'));
+    await tester.pump();
+    await tester.tap(find.text('Grace'));
+    await tester.pump();
+    await tester.enterText(find.byType(TextField).last, 'Hopper');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump();
+
+    expect(edit, (1, 1, 'Hopper'));
+  });
+
+  for (final renderer in ResultGridRenderer.values) {
+    testWidgets('${renderer.name} delays data-cell hover details', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 500,
+              height: 260,
+              child: ResultGrid(
+                renderer: renderer,
+                columns: const ['name'],
+                rows: const [
+                  ['A long cell value'],
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final tooltip = tester
+          .widgetList<Tooltip>(find.byType(Tooltip))
+          .where((item) => item.message == 'A long cell value')
+          .single;
+      expect(tooltip.waitDuration, const Duration(seconds: 2));
+    });
+  }
 }

@@ -67,6 +67,22 @@ void main() {
     expect(find.byType(InputChip), findsOneWidget);
   });
 
+  testWidgets('Ctrl+Enter sends the AI prompt', (tester) async {
+    await _pumpWorkbench(tester);
+    await tester.tap(find.byTooltip('Open AI Assistant'));
+    await tester.pump();
+
+    final prompt = find.byKey(const ValueKey('ai-prompt-field'));
+    await tester.tap(prompt);
+    await tester.enterText(prompt, 'Generate a query');
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await tester.pumpAndSettle();
+
+    expect(find.text('AI Provider Settings'), findsOneWidget);
+  });
+
   testWidgets('upper menu labels do not repeat as hover tooltips', (
     tester,
   ) async {
@@ -115,13 +131,41 @@ void main() {
       scheme.onSurfaceVariant,
     );
   });
+
+  testWidgets('narrow result toolbar does not overflow', (tester) async {
+    await _pumpWorkbench(tester, size: const Size(1100, 650));
+
+    expect(tester.takeException(), isNull);
+    expect(find.byTooltip('Grid renderer: QueryDock'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('sql-connection-compact-selector')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('sql-connection-dropdown')), findsNothing);
+  });
+
+  testWidgets('closing the final editor shows an empty workspace safely', (
+    tester,
+  ) async {
+    await _pumpWorkbench(tester);
+
+    await tester.tap(find.byTooltip('Close Tab (Ctrl+W)'));
+    await tester.pump();
+    await tester.pump();
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('Loading SQL scripts...'), findsNothing);
+    expect(find.text('No editors open'), findsOneWidget);
+    expect(find.byKey(const ValueKey('empty-editor-new-sql')), findsOneWidget);
+  });
 }
 
 Future<void> _pumpWorkbench(
   WidgetTester tester, {
   Brightness brightness = Brightness.light,
+  Size size = const Size(1800, 900),
 }) async {
-  tester.view.physicalSize = const Size(1800, 900);
+  tester.view.physicalSize = size;
   tester.view.devicePixelRatio = 1;
   addTearDown(tester.view.resetPhysicalSize);
   addTearDown(tester.view.resetDevicePixelRatio);

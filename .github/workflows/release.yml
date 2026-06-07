@@ -1,0 +1,61 @@
+name: Release QueryDock
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: dart analyze
+
+      - name: Test
+        run: flutter test
+
+      - name: Build Windows
+        run: flutter build windows --release
+
+      - name: Package release
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $source = "build/windows/x64/runner/Release"
+          $stage = "QueryDock-$version-windows-x64"
+          $archive = "$stage.zip"
+
+          New-Item -ItemType Directory -Path $stage
+          Copy-Item -Path "$source/*" -Destination $stage -Recurse
+          Compress-Archive -Path "$stage/*" -DestinationPath $archive
+
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          "$hash  $archive" | Set-Content -Encoding ascii "$archive.sha256"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}"
+          "QueryDock-${{ github.ref_name }}-windows-x64.zip"
+          "QueryDock-${{ github.ref_name }}-windows-x64.zip.sha256"
+          --title "QueryDock ${{ github.ref_name }}"
+          --generate-notes

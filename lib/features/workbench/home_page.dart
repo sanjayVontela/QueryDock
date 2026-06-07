@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -35,6 +37,8 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage> {
   static const String _showAllSqlScriptsKey = 'workbench.sql_scripts.show_all';
+  static const String _resultGridRendererKey =
+      'workbench.results.grid_renderer';
   static const String _globalScriptConnectionKey = 'global';
 
   late final IdeController _controller;
@@ -51,6 +55,7 @@ class _MyHomePageState extends State<MyHomePage> {
   bool _isConnecting = false;
   bool _showAllSqlScripts = false;
   bool _aiSending = false;
+  ResultGridRenderer _resultGridRenderer = ResultGridRenderer.queryDock;
   double _resultPanelHeight = 260;
   String _rightPanelMode = 'properties';
   AiAssistantSettings _aiSettings = const AiAssistantSettings();
@@ -103,6 +108,7 @@ class _MyHomePageState extends State<MyHomePage> {
     _initializeSqlEditor();
     _loadSavedConnections();
     _loadAiSettings();
+    _loadResultGridRenderer();
   }
 
   @override
@@ -144,6 +150,24 @@ class _MyHomePageState extends State<MyHomePage> {
     final settings = await _aiSettingsStore.load();
     if (!mounted) return;
     setState(() => _aiSettings = settings);
+  }
+
+  Future<void> _loadResultGridRenderer() async {
+    final preferences = await SharedPreferences.getInstance();
+    final saved = preferences.getString(_resultGridRendererKey);
+    if (!mounted || saved == null) return;
+    setState(() {
+      _resultGridRenderer = saved == ResultGridRenderer.pluto.name
+          ? ResultGridRenderer.pluto
+          : ResultGridRenderer.queryDock;
+    });
+  }
+
+  Future<void> _setResultGridRenderer(ResultGridRenderer renderer) async {
+    if (_resultGridRenderer == renderer) return;
+    setState(() => _resultGridRenderer = renderer);
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setString(_resultGridRendererKey, renderer.name);
   }
 
   void _showAiAssistant() {
@@ -220,10 +244,11 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _attachSchemaContext(_OpenConnection connection, DatabaseSchema schema) {
+    final database = connection.config.database;
     _addAiAttachment(
       _AiAttachment(
         id: 'schema:${connection.config.endpointName}:${schema.name}',
-        label: schema.name,
+        label: '$database.${schema.name}',
         icon: Icons.account_tree_outlined,
         content: _schemaAiContext(connection, schema),
       ),
@@ -273,12 +298,13 @@ class _MyHomePageState extends State<MyHomePage> {
     String schema,
     DatabaseTable table,
   ) {
+    final database = connection.config.database;
     _addAiAttachment(
       _AiAttachment(
         id: 'table:${connection.config.endpointName}:$schema.${table.name}',
-        label: '$schema.${table.name}',
+        label: '$database.$schema.${table.name}',
         icon: Icons.table_chart_outlined,
-        content: _tableAiContext(schema, table),
+        content: _tableAiContext(connection, schema, table),
       ),
     );
   }
@@ -354,9 +380,18 @@ class _MyHomePageState extends State<MyHomePage> {
     return buffer.toString();
   }
 
-  String _tableAiContext(String schema, DatabaseTable table) {
+  String _tableAiContext(
+    _OpenConnection connection,
+    String schema,
+    DatabaseTable table,
+  ) {
     final buffer = StringBuffer()
-      ..writeln('PostgreSQL table: $schema.${table.name}')
+      ..writeln('Connection: ${connection.config.displayName}')
+      ..writeln('Database: ${connection.config.database}')
+      ..writeln('Schema: $schema')
+      ..writeln(
+        'PostgreSQL table: ${connection.config.database}.$schema.${table.name}',
+      )
       ..writeln('Columns:');
     for (final column in table.columns) {
       buffer.writeln(
@@ -1434,22 +1469,18 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _closeSqlTab(_SqlScriptTab tab) {
-    var needsReplacementScript = false;
-
     setState(() {
       final index = _sqlTabs.indexOf(tab);
       if (index == -1) return;
 
       final wasActive = _activeCenterTab == index;
       _sqlTabs.removeAt(index);
-      tab.dispose();
 
       if (wasActive) {
         if (_sqlTabs.isNotEmpty) {
           _activeCenterTab = index.clamp(0, _sqlTabs.length - 1);
         } else {
           _activeCenterTab = 0;
-          needsReplacementScript = _openTableTabs.isEmpty;
         }
       } else if (_activeCenterTab > index) {
         _activeCenterTab--;
@@ -1457,10 +1488,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
       _logs.add('[INFO] Closed SQL script: ${tab.title}');
     });
-
-    if (needsReplacementScript) {
-      unawaited(_newSqlScript());
-    }
+    WidgetsBinding.instance.addPostFrameCallback((_) => tab.dispose());
   }
 
   void _executeShortcut() {
@@ -1780,9 +1808,7 @@ class _MyHomePageState extends State<MyHomePage> {
           database: database,
           connectionName: _activeConnection,
           schema: schema,
-          table: loadedTable.name,
-          columns: loadedTable.columns,
-          ddl: loadedTable.ddl,
+          metadata: loadedTable,
         );
         _openTableTabs.add(tab);
         _activeCenterTab = _tableTabOffset + _openTableTabs.length - 1;
@@ -2258,10 +2284,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _filterSqlTabsForActiveConnection() {
-    if (_sqlTabs.isEmpty) {
-      _sqlTabs.add(_SqlScriptTab(title: 'SQL Editor', text: ''));
-      _activeCenterTab = 0;
-    } else if (_activeCenterTab >= _sqlTabs.length) {
+    if (_sqlTabs.isNotEmpty && _activeCenterTab >= _sqlTabs.length) {
       _activeCenterTab = _sqlTabs.length - 1;
     }
   }
@@ -2605,7 +2628,12 @@ class _MyHomePageState extends State<MyHomePage> {
       context: context,
       applicationName: 'QueryDock',
       applicationVersion: '1.0.0',
-      applicationIcon: const Icon(Icons.storage, size: 32),
+      applicationIcon: Image.asset(
+        'assets/branding/querydock_logo.png',
+        width: 40,
+        height: 40,
+        filterQuality: FilterQuality.medium,
+      ),
       children: const [
         Text(
           'A lightweight PostgreSQL workbench with lazy navigator connections, SQL scripts, and table browsing.',
@@ -2781,6 +2809,7 @@ class _MyHomePageState extends State<MyHomePage> {
             ResultGrid(
               columns: _columns,
               rows: [for (final item in visibleRows) item.row],
+              renderer: _resultGridRenderer,
               sortColumn: _resultSortColumn,
               sortAscending: _resultSortAscending,
               filteredColumns: _resultColumnFilters.keys.toSet(),
@@ -3099,7 +3128,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
     final sqlTab = _activeSqlTab;
     if (sqlTab == null) {
-      return const Center(child: Text('Loading SQL scripts...'));
+      return _buildEmptyEditorPanel();
     }
 
     return Column(
@@ -3170,6 +3199,40 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  Widget _buildEmptyEditorPanel() {
+    return Column(
+      children: [
+        _buildCenterTabs(),
+        Expanded(
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.code_off_outlined,
+                  size: 34,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(height: 10),
+                const Text(
+                  'No editors open',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 10),
+                FilledButton.icon(
+                  key: const ValueKey('empty-editor-new-sql'),
+                  onPressed: () => unawaited(_newSqlScript()),
+                  icon: const Icon(Icons.add, size: 17),
+                  label: const Text('New SQL'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildResultHeader() {
     return ValueListenableBuilder<String>(
       valueListenable: _activeResultTab,
@@ -3183,64 +3246,96 @@ class _MyHomePageState extends State<MyHomePage> {
               bottom: BorderSide(color: Theme.of(context).dividerColor),
             ),
           ),
-          child: Row(
-            children: [
-              ResultTab(
-                title: 'Data',
-                icon: Icons.table_rows_outlined,
-                active: activeTab == 'Data',
-                onTap: () => _selectResultTab('Data'),
-              ),
-              ResultTab(
-                title: 'Messages',
-                icon: Icons.subject_outlined,
-                active: activeTab == 'Messages',
-                onTap: () => _selectResultTab('Messages'),
-              ),
-              const Spacer(),
-              if (activeTab == 'Data' && _resultColumnFilters.isNotEmpty)
-                IconButton(
-                  tooltip: 'Clear all filters',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: _isExecuting
-                      ? null
-                      : () {
-                          setState(() {
-                            _resultColumnFilters.clear();
-                            _resultIndexesReady = false;
-                          });
-                          unawaited(_refreshVisibleResultIndexes());
-                        },
-                  icon: const Icon(Icons.filter_alt_off_outlined, size: 18),
-                ),
-              if (activeTab == 'Data' && _resultPendingChanges.isNotEmpty) ...[
-                IconButton(
-                  tooltip: 'Cancel data changes',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: _isExecuting
-                      ? null
-                      : () => setState(_resultPendingChanges.clear),
-                  icon: const Icon(Icons.undo, size: 18),
-                ),
-                IconButton(
-                  tooltip: 'Save data changes',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: _isExecuting
-                      ? null
-                      : () => unawaited(_saveSqlResultChanges()),
-                  icon: const Icon(Icons.save_outlined, size: 18),
-                ),
-              ],
-              Text(
-                activeTab == 'Data'
-                    ? '${_visibleSqlResultRows.length} / ${_rows.length} rows'
-                    : '${_logs.length} messages',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-            ],
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final compact = constraints.maxWidth < 620;
+              final iconTabs = constraints.maxWidth < 360;
+              final showCount = constraints.maxWidth >= 520;
+              return Row(
+                children: [
+                  if (iconTabs) ...[
+                    _CompactResultTab(
+                      title: 'Data',
+                      icon: Icons.table_rows_outlined,
+                      active: activeTab == 'Data',
+                      onTap: () => _selectResultTab('Data'),
+                    ),
+                    _CompactResultTab(
+                      title: 'Messages',
+                      icon: Icons.subject_outlined,
+                      active: activeTab == 'Messages',
+                      onTap: () => _selectResultTab('Messages'),
+                    ),
+                  ] else ...[
+                    ResultTab(
+                      title: 'Data',
+                      icon: Icons.table_rows_outlined,
+                      active: activeTab == 'Data',
+                      onTap: () => _selectResultTab('Data'),
+                    ),
+                    ResultTab(
+                      title: 'Messages',
+                      icon: Icons.subject_outlined,
+                      active: activeTab == 'Messages',
+                      onTap: () => _selectResultTab('Messages'),
+                    ),
+                  ],
+                  const Spacer(),
+                  if (activeTab == 'Data' && _resultColumnFilters.isNotEmpty)
+                    IconButton(
+                      tooltip: 'Clear all filters',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: _isExecuting
+                          ? null
+                          : () {
+                              setState(() {
+                                _resultColumnFilters.clear();
+                                _resultIndexesReady = false;
+                              });
+                              unawaited(_refreshVisibleResultIndexes());
+                            },
+                      icon: const Icon(Icons.filter_alt_off_outlined, size: 18),
+                    ),
+                  if (activeTab == 'Data')
+                    _GridRendererControl(
+                      value: _resultGridRenderer,
+                      compact: compact,
+                      onChanged: (renderer) =>
+                          unawaited(_setResultGridRenderer(renderer)),
+                    ),
+                  if (activeTab == 'Data' && !compact) const SizedBox(width: 8),
+                  if (activeTab == 'Data' &&
+                      _resultPendingChanges.isNotEmpty) ...[
+                    IconButton(
+                      tooltip: 'Cancel data changes',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: _isExecuting
+                          ? null
+                          : () => setState(_resultPendingChanges.clear),
+                      icon: const Icon(Icons.undo, size: 18),
+                    ),
+                    IconButton(
+                      tooltip: 'Save data changes',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: _isExecuting
+                          ? null
+                          : () => unawaited(_saveSqlResultChanges()),
+                      icon: const Icon(Icons.save_outlined, size: 18),
+                    ),
+                  ],
+                  if (showCount)
+                    Text(
+                      activeTab == 'Data'
+                          ? '${_visibleSqlResultRows.length} / ${_rows.length} rows'
+                          : '${_logs.length} messages',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                ],
+              );
+            },
           ),
         );
       },
@@ -3266,90 +3361,87 @@ class _MyHomePageState extends State<MyHomePage> {
                 bottom: BorderSide(color: Theme.of(context).dividerColor),
               ),
             ),
-            child: Row(
-              children: [
-                const Icon(Icons.terminal, size: 16, color: Colors.blueGrey),
-                const SizedBox(width: 8),
-                Text(
-                  'Connection:',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: DropdownButtonHideUnderline(
-                    child: DropdownButton<String>(
-                      value:
-                          [
-                            _globalScriptConnectionKey,
-                            for (final connection in _connections)
-                              connection.config.endpointName,
-                          ].contains(sqlTab.connectionKey)
-                          ? sqlTab.connectionKey
-                          : _connectionForKey(
-                                  sqlTab.connectionKey,
-                                )?.config.endpointName ??
-                                _globalScriptConnectionKey,
-                      isDense: true,
-                      isExpanded: true,
-                      items: [
-                        const DropdownMenuItem(
-                          value: _globalScriptConnectionKey,
-                          child: Text('No connection'),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final compact = constraints.maxWidth < 440;
+                final connectionKeys = [
+                  _globalScriptConnectionKey,
+                  for (final connection in _connections)
+                    connection.config.endpointName,
+                ];
+                final selectedKey =
+                    connectionKeys.contains(sqlTab.connectionKey)
+                    ? sqlTab.connectionKey
+                    : _connectionForKey(
+                            sqlTab.connectionKey,
+                          )?.config.endpointName ??
+                          _globalScriptConnectionKey;
+                final selectedLabel = _scriptConnectionLabel(selectedKey);
+
+                return Row(
+                  children: [
+                    if (!compact) ...[
+                      const Icon(
+                        Icons.terminal,
+                        size: 16,
+                        color: Colors.blueGrey,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Connection:',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
                         ),
-                        for (final connection in _connections)
-                          DropdownMenuItem(
-                            value: connection.config.endpointName,
-                            child: Text(
-                              connection.config.displayName,
-                              overflow: TextOverflow.ellipsis,
-                              maxLines: 1,
-                            ),
-                          ),
-                      ],
-                      onChanged: (value) {
-                        if (value != null) {
-                          unawaited(_setSqlTabConnection(sqlTab, value));
-                        }
-                      },
+                      ),
+                      const SizedBox(width: 6),
+                    ],
+                    Expanded(
+                      child: _SqlConnectionSelector(
+                        compact: compact,
+                        value: selectedKey,
+                        label: selectedLabel,
+                        connections: _connections,
+                        globalKey: _globalScriptConnectionKey,
+                        onChanged: (value) =>
+                            unawaited(_setSqlTabConnection(sqlTab, value)),
+                      ),
                     ),
-                  ),
-                ),
-                const SizedBox(width: 6),
-                IconButton(
-                  tooltip: 'Complete SQL with AI',
-                  onPressed: sqlTab.aiCompleting
-                      ? null
-                      : () => unawaited(_requestAiCompletion(sqlTab)),
-                  icon: sqlTab.aiCompleting
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.auto_awesome_outlined, size: 17),
-                  padding: EdgeInsets.zero,
-                  visualDensity: VisualDensity.compact,
-                ),
-                IconButton(
-                  tooltip: 'Save SQL',
-                  onPressed: () => unawaited(_saveSql()),
-                  icon: const Icon(Icons.save, size: 17),
-                  padding: EdgeInsets.zero,
-                  visualDensity: VisualDensity.compact,
-                ),
-                IconButton(
-                  tooltip: 'Execute SQL',
-                  onPressed: _isExecuting || _isConnecting
-                      ? null
-                      : _executeShortcut,
-                  icon: const Icon(Icons.play_arrow, size: 18),
-                  padding: EdgeInsets.zero,
-                  visualDensity: VisualDensity.compact,
-                ),
-              ],
+                    if (!compact) const SizedBox(width: 6),
+                    IconButton(
+                      tooltip: 'Complete SQL with AI',
+                      onPressed: sqlTab.aiCompleting
+                          ? null
+                          : () => unawaited(_requestAiCompletion(sqlTab)),
+                      icon: sqlTab.aiCompleting
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.auto_awesome_outlined, size: 17),
+                      padding: EdgeInsets.zero,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    IconButton(
+                      tooltip: 'Save SQL',
+                      onPressed: () => unawaited(_saveSql()),
+                      icon: const Icon(Icons.save, size: 17),
+                      padding: EdgeInsets.zero,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    IconButton(
+                      tooltip: 'Execute SQL',
+                      onPressed: _isExecuting || _isConnecting
+                          ? null
+                          : _executeShortcut,
+                      icon: const Icon(Icons.play_arrow, size: 18),
+                      padding: EdgeInsets.zero,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ],
+                );
+              },
             ),
           ),
           Expanded(
@@ -3383,27 +3475,61 @@ class _MyHomePageState extends State<MyHomePage> {
               bottom: BorderSide(color: Theme.of(context).dividerColor),
             ),
           ),
-          child: Row(
-            children: [
-              ResultTab(
-                title: 'Properties',
-                icon: Icons.tune,
-                active: tab.innerTab == 'Properties',
-                onTap: () => _setTableDataTab('Properties'),
-              ),
-              ResultTab(
-                title: 'Data',
-                icon: Icons.table_rows_outlined,
-                active: tab.innerTab == 'Data',
-                onTap: () => _setTableDataTab('Data'),
-              ),
-              ResultTab(
-                title: 'Diagram',
-                icon: Icons.account_tree_outlined,
-                active: tab.innerTab == 'Diagram',
-                onTap: () => _setTableDataTab('Diagram'),
-              ),
-            ],
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final iconTabs = constraints.maxWidth < 520;
+              return Row(
+                children: [
+                  if (iconTabs) ...[
+                    _CompactResultTab(
+                      title: 'Properties',
+                      icon: Icons.tune,
+                      active: tab.innerTab == 'Properties',
+                      onTap: () => _setTableDataTab('Properties'),
+                    ),
+                    _CompactResultTab(
+                      title: 'Data',
+                      icon: Icons.table_rows_outlined,
+                      active: tab.innerTab == 'Data',
+                      onTap: () => _setTableDataTab('Data'),
+                    ),
+                    _CompactResultTab(
+                      title: 'Diagram',
+                      icon: Icons.account_tree_outlined,
+                      active: tab.innerTab == 'Diagram',
+                      onTap: () => _setTableDataTab('Diagram'),
+                    ),
+                  ] else ...[
+                    ResultTab(
+                      title: 'Properties',
+                      icon: Icons.tune,
+                      active: tab.innerTab == 'Properties',
+                      onTap: () => _setTableDataTab('Properties'),
+                    ),
+                    ResultTab(
+                      title: 'Data',
+                      icon: Icons.table_rows_outlined,
+                      active: tab.innerTab == 'Data',
+                      onTap: () => _setTableDataTab('Data'),
+                    ),
+                    ResultTab(
+                      title: 'Diagram',
+                      icon: Icons.account_tree_outlined,
+                      active: tab.innerTab == 'Diagram',
+                      onTap: () => _setTableDataTab('Diagram'),
+                    ),
+                  ],
+                  const Spacer(),
+                  if (tab.innerTab == 'Data')
+                    _GridRendererControl(
+                      value: _resultGridRenderer,
+                      compact: constraints.maxWidth < 680,
+                      onChanged: (renderer) =>
+                          unawaited(_setResultGridRenderer(renderer)),
+                    ),
+                ],
+              );
+            },
           ),
         ),
         Expanded(
@@ -3419,14 +3545,9 @@ class _MyHomePageState extends State<MyHomePage> {
   Widget _buildTableDataTabContent(_OpenTableTab tab) {
     switch (tab.innerTab) {
       case 'Properties':
-        return _TablePropertiesView(
-          schema: tab.schema,
-          table: tab.table,
-          columns: tab.columns,
-          ddl: tab.ddl,
-        );
+        return _TablePropertiesView(schema: tab.schema, metadata: tab.metadata);
       case 'Diagram':
-        return const _TableDiagramPlaceholder();
+        return _TableUmlDiagram(schema: tab.schema, metadata: tab.metadata);
       case 'Data':
       default:
         return Column(
@@ -3451,6 +3572,7 @@ class _MyHomePageState extends State<MyHomePage> {
               child: ResultGrid(
                 columns: tab.resultColumns,
                 rows: tab.rows,
+                renderer: _resultGridRenderer,
                 hasMoreRows: tab.hasMoreRows,
                 loadingMore: tab.loadingPage,
                 onLoadMore: tab.pendingChanges.isEmpty
@@ -3716,21 +3838,33 @@ class _MyHomePageState extends State<MyHomePage> {
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
                 Expanded(
-                  child: TextField(
-                    controller: _aiPromptController,
-                    minLines: 1,
-                    maxLines: 5,
-                    onSubmitted: (_) => unawaited(_sendAiPrompt()),
-                    decoration: const InputDecoration(
-                      hintText: 'Ask about the attached database context',
-                      isDense: true,
-                      border: OutlineInputBorder(),
+                  child: CallbackShortcuts(
+                    bindings: {
+                      const SingleActivator(
+                        LogicalKeyboardKey.enter,
+                        control: true,
+                      ): () =>
+                          unawaited(_sendAiPrompt()),
+                    },
+                    child: TextField(
+                      key: const ValueKey('ai-prompt-field'),
+                      controller: _aiPromptController,
+                      minLines: 1,
+                      maxLines: 5,
+                      keyboardType: TextInputType.multiline,
+                      textInputAction: TextInputAction.newline,
+                      decoration: const InputDecoration(
+                        hintText: 'Ask about the attached database context',
+                        helperText: 'Ctrl+Enter to send',
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
                     ),
                   ),
                 ),
                 const SizedBox(width: 6),
                 IconButton.filled(
-                  tooltip: 'Send',
+                  tooltip: 'Send (Ctrl+Enter)',
                   onPressed: _aiSending
                       ? null
                       : () => unawaited(_sendAiPrompt()),
@@ -4171,9 +4305,7 @@ class _OpenTableTab {
   final PostgresDatabase database;
   final String connectionName;
   final String schema;
-  final String table;
-  final List<DatabaseColumn> columns;
-  final String ddl;
+  final DatabaseTable metadata;
   final TextEditingController filterController = TextEditingController();
 
   String innerTab = 'Data';
@@ -4190,10 +4322,14 @@ class _OpenTableTab {
     required this.database,
     required this.connectionName,
     required this.schema,
-    required this.table,
-    required this.columns,
-    required this.ddl,
+    required this.metadata,
   });
+
+  String get table => metadata.name;
+
+  List<DatabaseColumn> get columns => metadata.columns;
+
+  String get ddl => metadata.ddl;
 
   String get id => '$schema.$table';
 
@@ -4541,6 +4677,7 @@ class _SqlScriptTab {
   _SqlEditorError? error;
   String? aiSuggestion;
   bool aiCompleting = false;
+  bool _disposed = false;
 
   _SqlScriptTab({
     required this.title,
@@ -4562,6 +4699,8 @@ class _SqlScriptTab {
   }
 
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
     controller.dispose();
     focusNode.dispose();
   }
@@ -5552,7 +5691,7 @@ class _TableTreeItem extends StatelessWidget {
             icon: Icons.key,
             title: 'Constraints',
             emptyText: 'No constraints found.',
-            items: table.constraints,
+            items: table.constraints.map((item) => item.toString()).toList(),
             loaded: table.columnsLoaded,
             isLoading: isLoading,
             onLoad: () => onExpand(schema, table),
@@ -5562,7 +5701,7 @@ class _TableTreeItem extends StatelessWidget {
             icon: Icons.format_list_numbered,
             title: 'Indexes',
             emptyText: 'No indexes found.',
-            items: table.indexes,
+            items: table.indexes.map((item) => item.toString()).toList(),
             loaded: table.columnsLoaded,
             isLoading: isLoading,
             onLoad: () => onExpand(schema, table),
@@ -5572,7 +5711,7 @@ class _TableTreeItem extends StatelessWidget {
             icon: Icons.link,
             title: 'Foreign Keys',
             emptyText: 'No foreign keys found.',
-            items: table.foreignKeys,
+            items: table.foreignKeys.map((item) => item.toString()).toList(),
             loaded: table.columnsLoaded,
             isLoading: isLoading,
             onLoad: () => onExpand(schema, table),
@@ -5582,7 +5721,7 @@ class _TableTreeItem extends StatelessWidget {
             icon: Icons.bolt,
             title: 'Triggers',
             emptyText: 'No triggers found.',
-            items: table.triggers,
+            items: table.triggers.map((item) => item.toString()).toList(),
             loaded: table.columnsLoaded,
             isLoading: isLoading,
             onLoad: () => onExpand(schema, table),
@@ -5737,6 +5876,196 @@ class _MenuAction extends StatelessWidget {
   }
 }
 
+class _GridRendererControl extends StatelessWidget {
+  final ResultGridRenderer value;
+  final bool compact;
+  final ValueChanged<ResultGridRenderer> onChanged;
+
+  const _GridRendererControl({
+    required this.value,
+    required this.onChanged,
+    this.compact = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (compact) {
+      return PopupMenuButton<ResultGridRenderer>(
+        tooltip: 'Grid renderer: ${_label(value)}',
+        initialValue: value,
+        onSelected: onChanged,
+        icon: Icon(
+          value == ResultGridRenderer.pluto
+              ? Icons.grid_on_outlined
+              : Icons.view_column_outlined,
+          size: 18,
+        ),
+        itemBuilder: (context) => [
+          for (final renderer in ResultGridRenderer.values)
+            PopupMenuItem(
+              value: renderer,
+              child: Row(
+                children: [
+                  Icon(
+                    renderer == ResultGridRenderer.pluto
+                        ? Icons.grid_on_outlined
+                        : Icons.view_column_outlined,
+                    size: 16,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(_label(renderer)),
+                  if (renderer == value) ...[
+                    const Spacer(),
+                    const Icon(Icons.check, size: 16),
+                  ],
+                ],
+              ),
+            ),
+        ],
+      );
+    }
+
+    return SizedBox(
+      height: 28,
+      child: SegmentedButton<ResultGridRenderer>(
+        showSelectedIcon: false,
+        segments: const [
+          ButtonSegment(
+            value: ResultGridRenderer.queryDock,
+            icon: Icon(Icons.view_column_outlined, size: 14),
+            label: Text('QueryDock'),
+          ),
+          ButtonSegment(
+            value: ResultGridRenderer.pluto,
+            icon: Icon(Icons.grid_on_outlined, size: 14),
+            label: Text('PlutoGrid'),
+          ),
+        ],
+        selected: {value},
+        onSelectionChanged: (selection) => onChanged(selection.first),
+        style: ButtonStyle(
+          visualDensity: VisualDensity.compact,
+          padding: const WidgetStatePropertyAll(
+            EdgeInsets.symmetric(horizontal: 8),
+          ),
+          textStyle: const WidgetStatePropertyAll(TextStyle(fontSize: 11)),
+        ),
+      ),
+    );
+  }
+
+  String _label(ResultGridRenderer renderer) {
+    return renderer == ResultGridRenderer.pluto ? 'PlutoGrid' : 'QueryDock';
+  }
+}
+
+class _SqlConnectionSelector extends StatelessWidget {
+  final bool compact;
+  final String value;
+  final String label;
+  final List<_OpenConnection> connections;
+  final String globalKey;
+  final ValueChanged<String> onChanged;
+
+  const _SqlConnectionSelector({
+    required this.compact,
+    required this.value,
+    required this.label,
+    required this.connections,
+    required this.globalKey,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (compact) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: PopupMenuButton<String>(
+          key: const ValueKey('sql-connection-compact-selector'),
+          tooltip: 'Script connection: $label',
+          initialValue: value,
+          onSelected: onChanged,
+          icon: Icon(
+            value == globalKey
+                ? Icons.link_off_outlined
+                : Icons.storage_outlined,
+            size: 18,
+          ),
+          itemBuilder: (context) => [
+            PopupMenuItem(value: globalKey, child: const Text('No connection')),
+            for (final connection in connections)
+              PopupMenuItem(
+                value: connection.config.endpointName,
+                child: Text(connection.config.displayName),
+              ),
+          ],
+        ),
+      );
+    }
+
+    return DropdownButtonHideUnderline(
+      child: DropdownButton<String>(
+        key: const ValueKey('sql-connection-dropdown'),
+        value: value,
+        isDense: true,
+        isExpanded: true,
+        items: [
+          DropdownMenuItem(
+            value: globalKey,
+            child: const Text('No connection'),
+          ),
+          for (final connection in connections)
+            DropdownMenuItem(
+              value: connection.config.endpointName,
+              child: Text(
+                connection.config.displayName,
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
+              ),
+            ),
+        ],
+        onChanged: (next) {
+          if (next != null) onChanged(next);
+        },
+      ),
+    );
+  }
+}
+
+class _CompactResultTab extends StatelessWidget {
+  final String title;
+  final IconData icon;
+  final bool active;
+  final VoidCallback onTap;
+
+  const _CompactResultTab({
+    required this.title,
+    required this.icon,
+    required this.active,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      tooltip: title,
+      onPressed: onTap,
+      visualDensity: VisualDensity.compact,
+      style: IconButton.styleFrom(
+        backgroundColor: active
+            ? Theme.of(context).colorScheme.surface
+            : Colors.transparent,
+        side: active
+            ? BorderSide(color: Theme.of(context).dividerColor)
+            : BorderSide.none,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+      ),
+      icon: Icon(icon, size: 17),
+    );
+  }
+}
+
 class _TableDataBrowserBar extends StatelessWidget {
   final String schema;
   final String table;
@@ -5776,80 +6105,149 @@ class _TableDataBrowserBar extends StatelessWidget {
       height: 42,
       color: Theme.of(context).colorScheme.surfaceContainer,
       padding: const EdgeInsets.symmetric(horizontal: 8),
-      child: Row(
-        children: [
-          const Icon(Icons.table_chart, size: 16, color: Colors.blueGrey),
-          const SizedBox(width: 6),
-          ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 220),
-            child: Text(
-              '$schema.$table',
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: TextField(
-              controller: filterController,
-              enabled: !isExecuting,
-              onSubmitted: (_) => onApplyFilter(),
-              style: const TextStyle(fontFamily: 'Consolas', fontSize: 13),
-              decoration: const InputDecoration(
-                prefixIcon: Icon(Icons.filter_alt, size: 16),
-                hintText: "Filter rows, e.g. status = 'ACTIVE'",
-                isDense: true,
-                border: OutlineInputBorder(),
-                contentPadding: EdgeInsets.symmetric(
-                  horizontal: 8,
-                  vertical: 8,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final compact = constraints.maxWidth < 560;
+          final medium = constraints.maxWidth < 900;
+          return Row(
+            children: [
+              if (!compact) ...[
+                const Icon(Icons.table_chart, size: 16, color: Colors.blueGrey),
+                const SizedBox(width: 6),
+                ConstrainedBox(
+                  constraints: BoxConstraints(maxWidth: medium ? 120 : 220),
+                  child: Text(
+                    '$schema.$table',
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+              ],
+              Expanded(
+                child: TextField(
+                  key: const ValueKey('table-data-filter'),
+                  controller: filterController,
+                  enabled: !isExecuting,
+                  onSubmitted: (_) => onApplyFilter(),
+                  style: const TextStyle(fontFamily: 'Consolas', fontSize: 13),
+                  decoration: InputDecoration(
+                    prefixIcon: const Icon(Icons.filter_alt, size: 16),
+                    hintText: compact
+                        ? 'Filter rows'
+                        : "Filter rows, e.g. status = 'ACTIVE'",
+                    isDense: true,
+                    border: const OutlineInputBorder(),
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 8,
+                    ),
+                  ),
                 ),
               ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            loadingMore
-                ? '$loadedRows rows, loading...'
-                : hasMoreRows
-                ? '$loadedRows rows loaded'
-                : '$loadedRows rows',
-            style: TextStyle(
-              fontSize: 11,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-          ),
-          const SizedBox(width: 4),
-          IconButton(
-            tooltip: canEdit
-                ? 'Save row changes'
-                : 'Editing requires a primary key',
-            onPressed: hasChanges && canEdit && !isExecuting
-                ? onSaveChanges
-                : null,
-            icon: const Icon(Icons.save, size: 18),
-          ),
-          IconButton(
-            tooltip: 'Cancel row changes',
-            onPressed: hasChanges && !isExecuting ? onCancelChanges : null,
-            icon: const Icon(Icons.undo, size: 18),
-          ),
-          IconButton(
-            tooltip: 'Apply filter',
-            onPressed: isExecuting ? null : onApplyFilter,
-            icon: const Icon(Icons.check, size: 18),
-          ),
-          IconButton(
-            tooltip: 'Refresh data',
-            onPressed: isExecuting ? null : onRefresh,
-            icon: const Icon(Icons.refresh, size: 18),
-          ),
-          IconButton(
-            tooltip: 'Close data browser',
-            onPressed: onClose,
-            icon: const Icon(Icons.close, size: 18),
-          ),
-        ],
+              if (!medium) ...[
+                const SizedBox(width: 8),
+                Text(
+                  loadingMore
+                      ? '$loadedRows rows, loading...'
+                      : hasMoreRows
+                      ? '$loadedRows rows loaded'
+                      : '$loadedRows rows',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(width: 4),
+              ],
+              if (!compact) ...[
+                IconButton(
+                  tooltip: 'Apply filter',
+                  onPressed: isExecuting ? null : onApplyFilter,
+                  icon: const Icon(Icons.check, size: 18),
+                ),
+                IconButton(
+                  tooltip: 'Refresh data',
+                  onPressed: isExecuting ? null : onRefresh,
+                  icon: const Icon(Icons.refresh, size: 18),
+                ),
+              ],
+              if (!medium) ...[
+                IconButton(
+                  tooltip: canEdit
+                      ? 'Save row changes'
+                      : 'Editing requires a primary key',
+                  onPressed: hasChanges && canEdit && !isExecuting
+                      ? onSaveChanges
+                      : null,
+                  icon: const Icon(Icons.save, size: 18),
+                ),
+                IconButton(
+                  tooltip: 'Cancel row changes',
+                  onPressed: hasChanges && !isExecuting
+                      ? onCancelChanges
+                      : null,
+                  icon: const Icon(Icons.undo, size: 18),
+                ),
+                IconButton(
+                  tooltip: 'Close data browser',
+                  onPressed: onClose,
+                  icon: const Icon(Icons.close, size: 18),
+                ),
+              ] else
+                PopupMenuButton<String>(
+                  key: const ValueKey('table-data-actions-menu'),
+                  tooltip: 'Table data actions',
+                  onSelected: (value) {
+                    switch (value) {
+                      case 'apply':
+                        onApplyFilter();
+                      case 'refresh':
+                        onRefresh();
+                      case 'save':
+                        onSaveChanges();
+                      case 'cancel':
+                        onCancelChanges();
+                      case 'close':
+                        onClose();
+                    }
+                  },
+                  itemBuilder: (context) => [
+                    PopupMenuItem(
+                      value: 'apply',
+                      enabled: !isExecuting,
+                      child: const Text('Apply filter'),
+                    ),
+                    PopupMenuItem(
+                      value: 'refresh',
+                      enabled: !isExecuting,
+                      child: const Text('Refresh data'),
+                    ),
+                    const PopupMenuDivider(),
+                    PopupMenuItem(
+                      value: 'save',
+                      enabled: hasChanges && canEdit && !isExecuting,
+                      child: const Text('Save changes'),
+                    ),
+                    PopupMenuItem(
+                      value: 'cancel',
+                      enabled: hasChanges && !isExecuting,
+                      child: const Text('Cancel changes'),
+                    ),
+                    const PopupMenuDivider(),
+                    const PopupMenuItem(
+                      value: 'close',
+                      child: Text('Close data browser'),
+                    ),
+                  ],
+                  icon: const Icon(Icons.more_vert, size: 18),
+                ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -5857,19 +6255,13 @@ class _TableDataBrowserBar extends StatelessWidget {
 
 class _TablePropertiesView extends StatelessWidget {
   final String schema;
-  final String table;
-  final List<DatabaseColumn> columns;
-  final String ddl;
+  final DatabaseTable metadata;
 
-  const _TablePropertiesView({
-    required this.schema,
-    required this.table,
-    required this.columns,
-    required this.ddl,
-  });
+  const _TablePropertiesView({required this.schema, required this.metadata});
 
   @override
   Widget build(BuildContext context) {
+    final columns = metadata.columns;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -5879,29 +6271,33 @@ class _TablePropertiesView extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 10),
           alignment: Alignment.centerLeft,
           child: Text(
-            '$schema.$table',
+            '$schema.${metadata.name}',
             style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
           ),
         ),
-        PropertyRow(name: 'Schema', value: schema),
-        PropertyRow(name: 'Table', value: table),
-        PropertyRow(name: 'Columns', value: '${columns.length}'),
         Expanded(
           child: DefaultTabController(
-            length: 2,
+            length: 7,
             child: Column(
               children: [
                 Container(
-                  height: 32,
+                  height: 34,
                   color: Theme.of(context).colorScheme.surfaceContainerHigh,
                   child: TabBar(
+                    isScrollable: true,
+                    tabAlignment: TabAlignment.start,
                     labelColor: Theme.of(context).colorScheme.onSurface,
                     unselectedLabelColor: Theme.of(
                       context,
                     ).colorScheme.onSurfaceVariant,
                     indicatorColor: Theme.of(context).colorScheme.primary,
                     tabs: const [
+                      Tab(text: 'Overview'),
                       Tab(text: 'Columns'),
+                      Tab(text: 'Constraints'),
+                      Tab(text: 'Foreign Keys'),
+                      Tab(text: 'Indexes'),
+                      Tab(text: 'Triggers'),
                       Tab(text: 'DDL'),
                     ],
                   ),
@@ -5909,30 +6305,83 @@ class _TablePropertiesView extends StatelessWidget {
                 Expanded(
                   child: TabBarView(
                     children: [
+                      _TableOverview(schema: schema, metadata: metadata),
                       ResultGrid(
-                        columns: const ['Name', 'Type', 'Nullable'],
+                        columns: const [
+                          'Name',
+                          'Type',
+                          'Nullable',
+                          'Primary Key',
+                          'Default',
+                          'Identity',
+                          'Generated',
+                          'Comment',
+                        ],
                         rows: [
                           for (final column in columns)
                             [
                               column.name,
                               column.dataType,
                               column.nullable ? 'YES' : 'NO',
+                              column.primaryKey ? 'YES' : '',
+                              column.defaultValue,
+                              column.identity,
+                              column.generated,
+                              column.comment,
                             ],
                         ],
                       ),
-                      Container(
-                        color: Theme.of(context).colorScheme.surface,
-                        padding: const EdgeInsets.all(12),
-                        alignment: Alignment.topLeft,
-                        child: SelectableText(
-                          ddl,
-                          style: const TextStyle(
-                            fontFamily: 'Consolas',
-                            fontSize: 13,
-                            height: 1.45,
-                          ),
-                        ),
+                      ResultGrid(
+                        columns: const ['Name', 'Type', 'Definition'],
+                        rows: [
+                          for (final item in metadata.constraints)
+                            [item.name, item.type, item.definition],
+                        ],
                       ),
+                      ResultGrid(
+                        columns: const [
+                          'Name',
+                          'Referenced Schema',
+                          'Referenced Table',
+                          'Definition',
+                        ],
+                        rows: [
+                          for (final item in metadata.foreignKeys)
+                            [
+                              item.name,
+                              item.referencedSchema,
+                              item.referencedTable,
+                              item.definition,
+                            ],
+                        ],
+                      ),
+                      ResultGrid(
+                        columns: const [
+                          'Name',
+                          'Unique',
+                          'Primary',
+                          'Constraint-owned',
+                          'Definition',
+                        ],
+                        rows: [
+                          for (final item in metadata.indexes)
+                            [
+                              item.name,
+                              item.unique ? 'YES' : 'NO',
+                              item.primary ? 'YES' : 'NO',
+                              item.constraintOwned ? 'YES' : 'NO',
+                              item.definition,
+                            ],
+                        ],
+                      ),
+                      ResultGrid(
+                        columns: const ['Name', 'State', 'Definition'],
+                        rows: [
+                          for (final item in metadata.triggers)
+                            [item.name, item.enabled, item.definition],
+                        ],
+                      ),
+                      _DdlViewer(ddl: metadata.ddl),
                     ],
                   ),
                 ),
@@ -5945,16 +6394,671 @@ class _TablePropertiesView extends StatelessWidget {
   }
 }
 
-class _TableDiagramPlaceholder extends StatelessWidget {
-  const _TableDiagramPlaceholder();
+class _TableOverview extends StatelessWidget {
+  final String schema;
+  final DatabaseTable metadata;
+
+  const _TableOverview({required this.schema, required this.metadata});
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: Text(
-        'Diagram view placeholder',
-        style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+    return ListView(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      children: [
+        PropertyRow(name: 'Schema', value: schema),
+        PropertyRow(name: 'Name', value: metadata.name),
+        PropertyRow(name: 'Type', value: metadata.relationType),
+        PropertyRow(
+          name: 'Owner',
+          value: metadata.owner.isEmpty ? '-' : metadata.owner,
+        ),
+        PropertyRow(name: 'Persistence', value: metadata.persistence),
+        PropertyRow(
+          name: 'Tablespace',
+          value: metadata.tablespace.isEmpty
+              ? 'pg_default'
+              : metadata.tablespace,
+        ),
+        PropertyRow(name: 'Columns', value: '${metadata.columns.length}'),
+        PropertyRow(
+          name: 'Constraints',
+          value: '${metadata.constraints.length + metadata.foreignKeys.length}',
+        ),
+        PropertyRow(name: 'Indexes', value: '${metadata.indexes.length}'),
+        PropertyRow(name: 'Triggers', value: '${metadata.triggers.length}'),
+        PropertyRow(
+          name: 'Estimated rows',
+          value: metadata.estimatedRows.toString(),
+        ),
+        PropertyRow(
+          name: 'Table size',
+          value: _formatBytes(metadata.tableBytes),
+        ),
+        PropertyRow(
+          name: 'Index size',
+          value: _formatBytes(metadata.indexBytes),
+        ),
+        PropertyRow(
+          name: 'Total size',
+          value: _formatBytes(metadata.totalBytes),
+        ),
+        PropertyRow(
+          name: 'Comment',
+          value: metadata.comment.isEmpty ? '-' : metadata.comment,
+        ),
+      ],
+    );
+  }
+
+  static String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    var value = bytes / 1024;
+    var unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return '${value.toStringAsFixed(value >= 10 ? 1 : 2)} ${units[unit]}';
+  }
+}
+
+class _DdlViewer extends StatefulWidget {
+  final String ddl;
+
+  const _DdlViewer({required this.ddl});
+
+  @override
+  State<_DdlViewer> createState() => _DdlViewerState();
+}
+
+class _DdlViewerState extends State<_DdlViewer> {
+  final ScrollController _verticalController = ScrollController();
+  final ScrollController _horizontalController = ScrollController();
+
+  @override
+  void dispose() {
+    _verticalController.dispose();
+    _horizontalController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: Theme.of(context).colorScheme.surface,
+      padding: const EdgeInsets.all(12),
+      alignment: Alignment.topLeft,
+      child: Scrollbar(
+        key: const ValueKey('ddl-vertical-scrollbar'),
+        controller: _verticalController,
+        notificationPredicate: (notification) =>
+            notification.metrics.axis == Axis.vertical,
+        child: SingleChildScrollView(
+          controller: _verticalController,
+          primary: false,
+          child: Scrollbar(
+            key: const ValueKey('ddl-horizontal-scrollbar'),
+            controller: _horizontalController,
+            scrollbarOrientation: ScrollbarOrientation.bottom,
+            notificationPredicate: (notification) =>
+                notification.metrics.axis == Axis.horizontal,
+            child: SingleChildScrollView(
+              controller: _horizontalController,
+              primary: false,
+              scrollDirection: Axis.horizontal,
+              child: SelectableText(
+                widget.ddl,
+                style: const TextStyle(
+                  fontFamily: 'Consolas',
+                  fontSize: 13,
+                  height: 1.45,
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
+  }
+}
+
+class _TableUmlDiagram extends StatefulWidget {
+  final String schema;
+  final DatabaseTable metadata;
+
+  const _TableUmlDiagram({required this.schema, required this.metadata});
+
+  @override
+  State<_TableUmlDiagram> createState() => _TableUmlDiagramState();
+}
+
+class _TableUmlDiagramState extends State<_TableUmlDiagram> {
+  final TransformationController _transformationController =
+      TransformationController();
+
+  @override
+  void dispose() {
+    _transformationController.dispose();
+    super.dispose();
+  }
+
+  void _zoom(double factor) {
+    final current = _transformationController.value;
+    final scale = current.getMaxScaleOnAxis();
+    final next = (scale * factor).clamp(0.35, 2.5);
+    _transformationController.value = Matrix4.diagonal3Values(next, next, 1);
+  }
+
+  void _reset() {
+    _transformationController.value = Matrix4.identity();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final metadata = widget.metadata;
+    final relationships = [
+      for (final foreignKey in metadata.foreignKeys)
+        _DiagramRelationship(foreignKey: foreignKey, incoming: false),
+      for (final foreignKey in metadata.incomingForeignKeys)
+        _DiagramRelationship(foreignKey: foreignKey, incoming: true),
+    ];
+    final related = <String, _DiagramEntity>{};
+    for (final relationship in relationships) {
+      final foreignKey = relationship.foreignKey;
+      final schema = relationship.incoming
+          ? foreignKey.sourceSchema
+          : foreignKey.referencedSchema;
+      final table = relationship.incoming
+          ? foreignKey.sourceTable
+          : foreignKey.referencedTable;
+      final columns = relationship.incoming
+          ? foreignKey.sourceColumns
+          : foreignKey.referencedColumns;
+      final key = '$schema.$table';
+      related.update(
+        key,
+        (entity) =>
+            entity.copyWith(columns: {...entity.columns, ...columns}.toList()),
+        ifAbsent: () =>
+            _DiagramEntity(schema: schema, table: table, columns: columns),
+      );
+    }
+
+    const canvasSize = Size(1400, 900);
+    const centerRect = Rect.fromLTWH(550, 260, 300, 380);
+    final relatedRects = <String, Rect>{};
+    final entities = related.values.toList();
+    for (var index = 0; index < entities.length; index++) {
+      final angle = entities.length == 1
+          ? 0.0
+          : (index / entities.length) * math.pi * 2 - math.pi / 2;
+      final x = 700 + math.cos(angle) * 470 - 130;
+      final y = 450 + math.sin(angle) * 300 - 105;
+      relatedRects[entities[index].key] = Rect.fromLTWH(x, y, 260, 225);
+    }
+
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: ColoredBox(
+            color: Theme.of(context).colorScheme.surfaceContainerLowest,
+            child: InteractiveViewer(
+              key: const ValueKey('table-uml-diagram'),
+              transformationController: _transformationController,
+              constrained: false,
+              minScale: 0.35,
+              maxScale: 2.5,
+              boundaryMargin: const EdgeInsets.all(240),
+              child: SizedBox.fromSize(
+                size: canvasSize,
+                child: Stack(
+                  children: [
+                    Positioned.fromRect(
+                      rect: centerRect,
+                      child: _UmlEntityCard(
+                        schema: widget.schema,
+                        table: metadata.name,
+                        columns: [
+                          for (final column in metadata.columns)
+                            _DiagramColumn(
+                              name: column.name,
+                              type: column.dataType,
+                              primaryKey: column.primaryKey,
+                              foreignKey: metadata.foreignKeys.any(
+                                (foreignKey) => foreignKey.sourceColumns
+                                    .contains(column.name),
+                              ),
+                              nullable: column.nullable,
+                            ),
+                        ],
+                        focused: true,
+                      ),
+                    ),
+                    for (final entity in entities)
+                      Positioned.fromRect(
+                        rect: relatedRects[entity.key]!,
+                        child: _UmlEntityCard(
+                          schema: entity.schema,
+                          table: entity.table,
+                          columns: [
+                            for (final column in entity.columns)
+                              _DiagramColumn(
+                                name: column,
+                                type: '',
+                                foreignKey: relationships.any(
+                                  (relationship) =>
+                                      relationship.incoming &&
+                                      relationship.foreignKey.sourceSchema ==
+                                          entity.schema &&
+                                      relationship.foreignKey.sourceTable ==
+                                          entity.table &&
+                                      relationship.foreignKey.sourceColumns
+                                          .contains(column),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: CustomPaint(
+                          key: const ValueKey('uml-relationship-overlay'),
+                          painter: _DiagramRelationshipPainter(
+                            centerRect: centerRect,
+                            relatedRects: relatedRects,
+                            relationships: relationships,
+                            centerSchema: widget.schema,
+                            centerTable: metadata.name,
+                            colorScheme: Theme.of(context).colorScheme,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+        Positioned(
+          top: 10,
+          right: 10,
+          child: Material(
+            color: Theme.of(context).colorScheme.surfaceContainer,
+            elevation: 2,
+            borderRadius: BorderRadius.circular(6),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  tooltip: 'Zoom out',
+                  onPressed: () => _zoom(0.8),
+                  icon: const Icon(Icons.remove, size: 18),
+                ),
+                IconButton(
+                  tooltip: 'Reset diagram',
+                  onPressed: _reset,
+                  icon: const Icon(Icons.center_focus_strong, size: 18),
+                ),
+                IconButton(
+                  tooltip: 'Zoom in',
+                  onPressed: () => _zoom(1.25),
+                  icon: const Icon(Icons.add, size: 18),
+                ),
+              ],
+            ),
+          ),
+        ),
+        Positioned(
+          left: 12,
+          bottom: 10,
+          child: Text(
+            relationships.isEmpty
+                ? 'No foreign-key relationships found'
+                : '${relationships.length} relationship${relationships.length == 1 ? '' : 's'}',
+            style: TextStyle(
+              fontSize: 11,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _DiagramEntity {
+  final String schema;
+  final String table;
+  final List<String> columns;
+
+  const _DiagramEntity({
+    required this.schema,
+    required this.table,
+    required this.columns,
+  });
+
+  String get key => '$schema.$table';
+
+  _DiagramEntity copyWith({List<String>? columns}) {
+    return _DiagramEntity(
+      schema: schema,
+      table: table,
+      columns: columns ?? this.columns,
+    );
+  }
+}
+
+class _DiagramRelationship {
+  final DatabaseForeignKey foreignKey;
+  final bool incoming;
+
+  const _DiagramRelationship({
+    required this.foreignKey,
+    required this.incoming,
+  });
+}
+
+class _DiagramColumn {
+  final String name;
+  final String type;
+  final bool primaryKey;
+  final bool foreignKey;
+  final bool nullable;
+
+  const _DiagramColumn({
+    required this.name,
+    required this.type,
+    this.primaryKey = false,
+    this.foreignKey = false,
+    this.nullable = true,
+  });
+}
+
+class _UmlEntityCard extends StatelessWidget {
+  final String schema;
+  final String table;
+  final List<_DiagramColumn> columns;
+  final bool focused;
+
+  const _UmlEntityCard({
+    required this.schema,
+    required this.table,
+    required this.columns,
+    this.focused = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final visibleColumns = columns.take(focused ? 11 : 6).toList();
+    return Material(
+      color: Theme.of(context).colorScheme.surface,
+      elevation: focused ? 5 : 2,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(6),
+        side: BorderSide(
+          color: focused
+              ? Theme.of(context).colorScheme.primary
+              : Theme.of(context).dividerColor,
+          width: focused ? 2 : 1,
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            height: 48,
+            color: focused
+                ? Theme.of(context).colorScheme.primaryContainer
+                : Theme.of(context).colorScheme.surfaceContainerHigh,
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  table,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                Text(
+                  schema,
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          for (final column in visibleColumns)
+            SizedBox(
+              height: 25,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 38,
+                      child: Row(
+                        children: [
+                          if (column.primaryKey)
+                            const Icon(
+                              Icons.key,
+                              size: 13,
+                              color: Colors.amber,
+                            ),
+                          if (column.foreignKey)
+                            const Icon(
+                              Icons.link,
+                              size: 13,
+                              color: Colors.blueGrey,
+                            ),
+                        ],
+                      ),
+                    ),
+                    Expanded(
+                      child: Text(
+                        column.name,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontFamily: 'Consolas',
+                          fontSize: 11,
+                        ),
+                      ),
+                    ),
+                    if (column.type.isNotEmpty)
+                      Flexible(
+                        child: Text(
+                          column.type,
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.right,
+                          style: TextStyle(
+                            fontFamily: 'Consolas',
+                            fontSize: 10,
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    if (!column.nullable)
+                      const Padding(
+                        padding: EdgeInsets.only(left: 4),
+                        child: Text('*', style: TextStyle(fontSize: 11)),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          if (columns.length > visibleColumns.length)
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Text(
+                '+ ${columns.length - visibleColumns.length} more columns',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DiagramRelationshipPainter extends CustomPainter {
+  final Rect centerRect;
+  final Map<String, Rect> relatedRects;
+  final List<_DiagramRelationship> relationships;
+  final String centerSchema;
+  final String centerTable;
+  final ColorScheme colorScheme;
+
+  const _DiagramRelationshipPainter({
+    required this.centerRect,
+    required this.relatedRects,
+    required this.relationships,
+    required this.centerSchema,
+    required this.centerTable,
+    required this.colorScheme,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final relationshipCounts = <String, int>{};
+    for (final relationship in relationships) {
+      final key = _relatedKey(relationship);
+      relationshipCounts[key] = (relationshipCounts[key] ?? 0) + 1;
+    }
+    final relationshipIndexes = <String, int>{};
+
+    for (final relationship in relationships) {
+      final foreignKey = relationship.foreignKey;
+      final relatedKey = _relatedKey(relationship);
+      final relatedRect = relatedRects[relatedKey];
+      if (relatedRect == null) continue;
+
+      final fromRect = relationship.incoming ? relatedRect : centerRect;
+      final toRect = relationship.incoming ? centerRect : relatedRect;
+      final relationshipIndex = relationshipIndexes.update(
+        relatedKey,
+        (index) => index + 1,
+        ifAbsent: () => 0,
+      );
+      final count = relationshipCounts[relatedKey] ?? 1;
+      final lane = (relationshipIndex - (count - 1) / 2) * 14;
+      final horizontal =
+          (toRect.center.dx - fromRect.center.dx).abs() >=
+          (toRect.center.dy - fromRect.center.dy).abs();
+      final laneOffset = horizontal ? Offset(0, lane) : Offset(lane, 0);
+      final from = _edgePoint(fromRect, toRect.center) + laneOffset;
+      final to = _edgePoint(toRect, fromRect.center) + laneOffset;
+      final middleX = (from.dx + to.dx) / 2;
+      final path = ui.Path()
+        ..moveTo(from.dx, from.dy)
+        ..lineTo(middleX, from.dy)
+        ..lineTo(middleX, to.dy)
+        ..lineTo(to.dx, to.dy);
+
+      final backingPaint = Paint()
+        ..color = colorScheme.surface
+        ..strokeWidth = 6
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round
+        ..style = PaintingStyle.stroke;
+      final relationshipColor = relationship.incoming
+          ? colorScheme.tertiary
+          : colorScheme.primary;
+      final linePaint = Paint()
+        ..color = relationshipColor
+        ..strokeWidth = 2.5
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round
+        ..style = PaintingStyle.stroke;
+      canvas
+        ..drawPath(path, backingPaint)
+        ..drawPath(path, linePaint)
+        ..drawCircle(to, 5, Paint()..color = colorScheme.surface)
+        ..drawCircle(to, 3.5, Paint()..color = relationshipColor);
+      _paintText(
+        canvas,
+        '*',
+        from + const Offset(6, -17),
+        colorScheme,
+        relationshipColor,
+      );
+      _paintText(
+        canvas,
+        '1',
+        to + const Offset(6, -17),
+        colorScheme,
+        relationshipColor,
+      );
+      _paintText(
+        canvas,
+        foreignKey.name,
+        Offset(middleX + 5, (from.dy + to.dy) / 2 - 16),
+        colorScheme,
+        relationshipColor,
+      );
+    }
+  }
+
+  String _relatedKey(_DiagramRelationship relationship) {
+    final foreignKey = relationship.foreignKey;
+    return relationship.incoming
+        ? '${foreignKey.sourceSchema}.${foreignKey.sourceTable}'
+        : '${foreignKey.referencedSchema}.${foreignKey.referencedTable}';
+  }
+
+  Offset _edgePoint(Rect rect, Offset toward) {
+    final dx = toward.dx - rect.center.dx;
+    final dy = toward.dy - rect.center.dy;
+    if (dx.abs() * rect.height > dy.abs() * rect.width) {
+      return Offset(dx > 0 ? rect.right : rect.left, rect.center.dy);
+    }
+    return Offset(rect.center.dx, dy > 0 ? rect.bottom : rect.top);
+  }
+
+  void _paintText(
+    Canvas canvas,
+    String text,
+    Offset offset,
+    ColorScheme scheme,
+    Color color,
+  ) {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: TextStyle(
+          color: color,
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout(maxWidth: 180);
+    final backgroundRect = RRect.fromRectAndRadius(
+      offset & Size(painter.width + 6, painter.height + 2),
+      const Radius.circular(3),
+    );
+    canvas.drawRRect(
+      backgroundRect,
+      Paint()..color = scheme.surface.withValues(alpha: 0.94),
+    );
+    painter.paint(canvas, offset + const Offset(3, 1));
+  }
+
+  @override
+  bool shouldRepaint(covariant _DiagramRelationshipPainter oldDelegate) {
+    return oldDelegate.relationships != relationships ||
+        oldDelegate.colorScheme != colorScheme;
   }
 }

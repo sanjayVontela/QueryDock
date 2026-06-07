@@ -402,94 +402,287 @@ ORDER BY schema_name;
     final metadataResult = await _pool.execute(
       Sql.named('''
 SELECT 'column' AS kind,
-       c.column_name AS name,
-       COALESCE(
-         CASE
-           WHEN c.data_type IN ('character varying', 'character', 'bit varying', 'bit')
-             AND c.character_maximum_length IS NOT NULL
-             THEN c.data_type || '(' || c.character_maximum_length || ')'
-           WHEN c.data_type = 'numeric' AND c.numeric_precision IS NOT NULL
-             THEN c.data_type || '(' || c.numeric_precision ||
-                  COALESCE(',' || c.numeric_scale, '') || ')'
-           ELSE c.data_type
-         END,
-         c.udt_name
-       ) AS detail,
-       c.is_nullable AS extra,
-       c.ordinal_position AS sort_order
-FROM information_schema.columns c
-WHERE c.table_schema = @schema
-  AND c.table_name = @table
+       a.attname AS name,
+       pg_catalog.format_type(a.atttypid, a.atttypmod) AS detail,
+       CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS extra,
+       COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '') AS value1,
+       CASE a.attidentity
+         WHEN 'a' THEN 'ALWAYS'
+         WHEN 'd' THEN 'BY DEFAULT'
+         ELSE ''
+       END AS value2,
+       CASE a.attgenerated WHEN 's' THEN 'STORED' ELSE '' END AS value3,
+       COALESCE(col_description(a.attrelid, a.attnum), '') AS value4,
+       '' AS value5,
+       '' AS value6,
+       '' AS value7,
+       '' AS value8,
+       a.attnum AS sort_order
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_attrdef ad
+  ON ad.adrelid = a.attrelid
+ AND ad.adnum = a.attnum
+WHERE n.nspname = @schema
+  AND c.relname = @table
+  AND a.attnum > 0
+  AND NOT a.attisdropped
 UNION ALL
-SELECT 'primary-key', kcu.column_name, '', '', 100000 + kcu.ordinal_position
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-  ON kcu.constraint_name = tc.constraint_name
- AND kcu.constraint_schema = tc.constraint_schema
-WHERE tc.table_schema = @schema
-  AND tc.table_name = @table
-  AND tc.constraint_type = 'PRIMARY KEY'
+SELECT 'relation',
+       c.relname,
+       CASE c.relkind
+         WHEN 'r' THEN 'Table'
+         WHEN 'p' THEN 'Partitioned table'
+         WHEN 'v' THEN 'View'
+         WHEN 'm' THEN 'Materialized view'
+         WHEN 'f' THEN 'Foreign table'
+         ELSE 'Relation'
+       END,
+       r.rolname,
+       COALESCE(obj_description(c.oid, 'pg_class'), ''),
+       COALESCE(ts.spcname, 'pg_default'),
+       CASE c.relpersistence
+         WHEN 'u' THEN 'Unlogged'
+         WHEN 't' THEN 'Temporary'
+         ELSE 'Permanent'
+       END,
+       GREATEST(c.reltuples::bigint, 0)::text,
+       pg_total_relation_size(c.oid)::text,
+       pg_relation_size(c.oid)::text,
+       pg_indexes_size(c.oid)::text,
+       CASE
+         WHEN c.relkind IN ('v', 'm') THEN pg_get_viewdef(c.oid, true)
+         WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid)
+         ELSE ''
+       END,
+       0
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
+LEFT JOIN pg_catalog.pg_tablespace ts ON ts.oid = c.reltablespace
+WHERE n.nspname = @schema
+  AND c.relname = @table
 UNION ALL
-SELECT 'constraint', constraint_name, constraint_type, '', 200000
-FROM information_schema.table_constraints
-WHERE table_schema = @schema
-  AND table_name = @table
+SELECT CASE WHEN con.contype = 'f' THEN 'foreign-key' ELSE 'constraint' END,
+       con.conname,
+       CASE con.contype
+         WHEN 'p' THEN 'PRIMARY KEY'
+         WHEN 'u' THEN 'UNIQUE'
+         WHEN 'c' THEN 'CHECK'
+         WHEN 'x' THEN 'EXCLUDE'
+         WHEN 'f' THEN 'FOREIGN KEY'
+         ELSE con.contype::text
+       END,
+       pg_get_constraintdef(con.oid, true),
+       COALESCE(ref_ns.nspname, ''),
+       COALESCE(ref.relname, ''),
+       COALESCE((
+         SELECT string_agg(att.attname, chr(31) ORDER BY key_column.ordinality)
+         FROM unnest(con.conkey) WITH ORDINALITY key_column(attnum, ordinality)
+         JOIN pg_catalog.pg_attribute att
+           ON att.attrelid = con.conrelid
+          AND att.attnum = key_column.attnum
+       ), ''),
+       '', '', '', '', '',
+       200000
+FROM pg_catalog.pg_constraint con
+JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_class ref ON ref.oid = con.confrelid
+LEFT JOIN pg_catalog.pg_namespace ref_ns ON ref_ns.oid = ref.relnamespace
+WHERE n.nspname = @schema
+  AND c.relname = @table
 UNION ALL
-SELECT 'index', indexname, '', '', 300000
-FROM pg_indexes
-WHERE schemaname = @schema
-  AND tablename = @table
+SELECT 'incoming-foreign-key',
+       con.conname,
+       'FOREIGN KEY',
+       pg_get_constraintdef(con.oid, true),
+       source_ns.nspname,
+       source.relname,
+       COALESCE((
+         SELECT string_agg(att.attname, chr(31) ORDER BY key_column.ordinality)
+         FROM unnest(con.conkey) WITH ORDINALITY key_column(attnum, ordinality)
+         JOIN pg_catalog.pg_attribute att
+           ON att.attrelid = con.conrelid
+          AND att.attnum = key_column.attnum
+       ), ''),
+       COALESCE((
+         SELECT string_agg(att.attname, chr(31) ORDER BY key_column.ordinality)
+         FROM unnest(con.confkey) WITH ORDINALITY key_column(attnum, ordinality)
+         JOIN pg_catalog.pg_attribute att
+           ON att.attrelid = con.confrelid
+          AND att.attnum = key_column.attnum
+       ), ''),
+       '', '', '', '',
+       250000
+FROM pg_catalog.pg_constraint con
+JOIN pg_catalog.pg_class source ON source.oid = con.conrelid
+JOIN pg_catalog.pg_namespace source_ns ON source_ns.oid = source.relnamespace
+JOIN pg_catalog.pg_class target ON target.oid = con.confrelid
+JOIN pg_catalog.pg_namespace target_ns ON target_ns.oid = target.relnamespace
+WHERE con.contype = 'f'
+  AND target_ns.nspname = @schema
+  AND target.relname = @table
+  AND con.conrelid <> con.confrelid
 UNION ALL
-SELECT 'foreign-key',
-       tc.constraint_name,
-       ccu.table_schema || '.' || ccu.table_name,
-       '',
+SELECT 'index',
+       idx.relname,
+       pg_get_indexdef(idx.oid),
+       CASE WHEN i.indisunique THEN 'YES' ELSE 'NO' END,
+       CASE WHEN i.indisprimary THEN 'YES' ELSE 'NO' END,
+       CASE WHEN con.oid IS NOT NULL THEN 'YES' ELSE 'NO' END,
+       '', '', '', '', '', '',
+       300000
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class tbl ON tbl.oid = i.indrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = tbl.relnamespace
+JOIN pg_catalog.pg_class idx ON idx.oid = i.indexrelid
+LEFT JOIN pg_catalog.pg_constraint con ON con.conindid = idx.oid
+WHERE n.nspname = @schema
+  AND tbl.relname = @table
+UNION ALL
+SELECT 'trigger',
+       trg.tgname,
+       pg_get_triggerdef(trg.oid, true),
+       CASE trg.tgenabled
+         WHEN 'O' THEN 'Enabled'
+         WHEN 'D' THEN 'Disabled'
+         WHEN 'R' THEN 'Replica'
+         WHEN 'A' THEN 'Always'
+         ELSE trg.tgenabled::text
+       END,
+       '', '', '', '', '', '', '', '',
        400000
-FROM information_schema.table_constraints tc
-JOIN information_schema.constraint_column_usage ccu
-  ON ccu.constraint_name = tc.constraint_name
- AND ccu.constraint_schema = tc.constraint_schema
-WHERE tc.table_schema = @schema
-  AND tc.table_name = @table
-  AND tc.constraint_type = 'FOREIGN KEY'
-UNION ALL
-SELECT 'trigger', trigger_name, event_manipulation, '', 500000
-FROM information_schema.triggers
-WHERE event_object_schema = @schema
-  AND event_object_table = @table
+FROM pg_catalog.pg_trigger trg
+JOIN pg_catalog.pg_class c ON c.oid = trg.tgrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = @schema
+  AND c.relname = @table
+  AND NOT trg.tgisinternal
 ORDER BY sort_order, name;
 '''),
       parameters: {'schema': schema, 'table': table},
     );
 
     final primaryKeys = <String>{};
-    final rawColumns = <({String name, String type, bool nullable})>[];
-    final constraints = <String>[];
-    final indexes = <String>[];
-    final foreignKeys = <String>[];
-    final triggers = <String>[];
+    final rawColumns =
+        <
+          ({
+            String name,
+            String type,
+            bool nullable,
+            String defaultValue,
+            String identity,
+            String generated,
+            String comment,
+          })
+        >[];
+    final constraints = <DatabaseConstraint>[];
+    final indexes = <DatabaseIndex>[];
+    final foreignKeys = <DatabaseForeignKey>[];
+    final incomingForeignKeys = <DatabaseForeignKey>[];
+    final triggers = <DatabaseTrigger>[];
+    var relationType = 'Table';
+    var owner = '';
+    var comment = '';
+    var tablespace = '';
+    var persistence = 'Permanent';
+    var estimatedRows = 0;
+    var totalBytes = 0;
+    var tableBytes = 0;
+    var indexBytes = 0;
+    var viewDefinition = '';
     for (final row in metadataResult) {
       final kind = row[0]?.toString() ?? '';
       final name = row[1]?.toString() ?? '';
       final detail = row[2]?.toString() ?? '';
       final extra = row[3]?.toString() ?? '';
+      final value1 = row[4]?.toString() ?? '';
+      final value2 = row[5]?.toString() ?? '';
+      final value3 = row[6]?.toString() ?? '';
+      final value4 = row[7]?.toString() ?? '';
+      final value5 = row[8]?.toString() ?? '';
+      final value6 = row[9]?.toString() ?? '';
+      final value7 = row[10]?.toString() ?? '';
       switch (kind) {
         case 'column':
           rawColumns.add((
             name: name,
             type: detail.isEmpty ? 'unknown' : detail,
             nullable: extra == 'YES',
+            defaultValue: value1,
+            identity: value2,
+            generated: value3,
+            comment: value4,
           ));
-        case 'primary-key':
-          primaryKeys.add(name);
+        case 'relation':
+          relationType = detail;
+          owner = extra;
+          comment = value1;
+          tablespace = value2;
+          persistence = value3;
+          estimatedRows = int.tryParse(value4) ?? 0;
+          totalBytes = int.tryParse(value5) ?? 0;
+          tableBytes = int.tryParse(value6) ?? 0;
+          indexBytes = int.tryParse(value7) ?? 0;
+          viewDefinition = row[11]?.toString() ?? '';
         case 'constraint':
-          constraints.add('$name  [$detail]');
+          constraints.add(
+            DatabaseConstraint(name: name, type: detail, definition: extra),
+          );
+          if (detail == 'PRIMARY KEY') {
+            primaryKeys.addAll(
+              value3.isEmpty
+                  ? _constraintColumns(extra)
+                  : value3.split(String.fromCharCode(31)),
+            );
+          }
         case 'index':
-          indexes.add(name);
+          indexes.add(
+            DatabaseIndex(
+              name: name,
+              definition: detail,
+              unique: extra == 'YES',
+              primary: value1 == 'YES',
+              constraintOwned: value2 == 'YES',
+            ),
+          );
         case 'foreign-key':
-          foreignKeys.add('$name  -> $detail');
+          final columns = _foreignKeyColumns(extra);
+          foreignKeys.add(
+            DatabaseForeignKey(
+              name: name,
+              sourceSchema: schema,
+              sourceTable: table,
+              referencedSchema: value1,
+              referencedTable: value2,
+              sourceColumns: columns.$1,
+              referencedColumns: columns.$2,
+              definition: extra,
+            ),
+          );
+        case 'incoming-foreign-key':
+          incomingForeignKeys.add(
+            DatabaseForeignKey(
+              name: name,
+              sourceSchema: value1,
+              sourceTable: value2,
+              referencedSchema: schema,
+              referencedTable: table,
+              sourceColumns: value3.isEmpty
+                  ? _foreignKeyColumns(extra).$1
+                  : value3.split(String.fromCharCode(31)),
+              referencedColumns: value4.isEmpty
+                  ? _foreignKeyColumns(extra).$2
+                  : value4.split(String.fromCharCode(31)),
+              definition: extra,
+            ),
+          );
         case 'trigger':
-          triggers.add('$name  [$detail]');
+          triggers.add(
+            DatabaseTrigger(name: name, enabled: extra, definition: detail),
+          );
       }
     }
     final columns = [
@@ -499,17 +692,46 @@ ORDER BY sort_order, name;
           dataType: column.type,
           nullable: column.nullable,
           primaryKey: primaryKeys.contains(column.name),
+          defaultValue: column.defaultValue,
+          identity: column.identity,
+          generated: column.generated,
+          comment: column.comment,
         ),
     ];
 
-    final loadedTable = DatabaseTable(
-      name: table,
+    final ddl = buildTableDdl(
+      schema: schema,
+      table: table,
+      relationType: relationType,
+      owner: owner,
+      comment: comment,
+      tablespace: tablespace,
+      persistence: persistence,
+      viewDefinition: viewDefinition,
       columns: columns,
-      ddl: _buildCreateTableDdl(schema, table, columns),
-      columnsLoaded: true,
       constraints: constraints,
       indexes: indexes,
       foreignKeys: foreignKeys,
+      triggers: triggers,
+    );
+    final loadedTable = DatabaseTable(
+      name: table,
+      columns: columns,
+      ddl: ddl,
+      columnsLoaded: true,
+      relationType: relationType,
+      owner: owner,
+      comment: comment,
+      tablespace: tablespace,
+      persistence: persistence,
+      estimatedRows: estimatedRows,
+      totalBytes: totalBytes,
+      tableBytes: tableBytes,
+      indexBytes: indexBytes,
+      constraints: constraints,
+      indexes: indexes,
+      foreignKeys: foreignKeys,
+      incomingForeignKeys: incomingForeignKeys,
       triggers: triggers,
     );
     _tableDetailCache[cacheKey] = loadedTable;
@@ -684,21 +906,130 @@ ORDER BY sort_order, name;
     return 'column_${index + 1}';
   }
 
-  static String _buildCreateTableDdl(
-    String schema,
-    String table,
-    List<DatabaseColumn> columns,
-  ) {
+  static Set<String> _constraintColumns(String definition) {
+    final match = RegExp(
+      r'^(?:PRIMARY KEY|UNIQUE)\s*\((.*)\)',
+      caseSensitive: false,
+    ).firstMatch(definition);
+    if (match == null) return const {};
+    return {
+      for (final item in match.group(1)!.split(','))
+        item.trim().replaceAll(RegExp(r'^"|"$'), '').replaceAll('""', '"'),
+    };
+  }
+
+  static (List<String>, List<String>) _foreignKeyColumns(String definition) {
+    final match = RegExp(
+      r'FOREIGN KEY\s*\(([^)]*)\)\s*REFERENCES\s+.+?\s*\(([^)]*)\)',
+      caseSensitive: false,
+    ).firstMatch(definition);
+    if (match == null) return (const [], const []);
+    List<String> parse(String value) => [
+      for (final item in value.split(','))
+        item.trim().replaceAll(RegExp(r'^"|"$'), '').replaceAll('""', '"'),
+    ];
+    return (parse(match.group(1)!), parse(match.group(2)!));
+  }
+
+  static String buildTableDdl({
+    required String schema,
+    required String table,
+    required String relationType,
+    required String owner,
+    required String comment,
+    required String tablespace,
+    required String persistence,
+    required String viewDefinition,
+    required List<DatabaseColumn> columns,
+    required List<DatabaseConstraint> constraints,
+    required List<DatabaseIndex> indexes,
+    required List<DatabaseForeignKey> foreignKeys,
+    required List<DatabaseTrigger> triggers,
+  }) {
+    final qualifiedName =
+        '${_quoteIdentifier(schema)}.${_quoteIdentifier(table)}';
+    if (relationType == 'View' || relationType == 'Materialized view') {
+      final materialized = relationType == 'Materialized view'
+          ? 'MATERIALIZED '
+          : '';
+      return [
+        'CREATE ${materialized}VIEW $qualifiedName AS',
+        viewDefinition.trim().endsWith(';')
+            ? viewDefinition.trim()
+            : '${viewDefinition.trim()};',
+        if (owner.isNotEmpty)
+          'ALTER ${materialized}VIEW $qualifiedName OWNER TO ${_quoteIdentifier(owner)};',
+        if (comment.isNotEmpty)
+          'COMMENT ON ${materialized}VIEW $qualifiedName IS ${_quoteLiteral(comment)};',
+      ].join('\n\n');
+    }
+
     final columnLines = [
-      for (final column in columns)
-        '  ${_quoteIdentifier(column.name)} ${column.dataType}${column.nullable ? '' : ' NOT NULL'}',
+      for (final column in columns) '  ${_columnDefinition(column)}',
     ];
 
-    return [
-      'CREATE TABLE ${_quoteIdentifier(schema)}.${_quoteIdentifier(table)} (',
-      columnLines.join(',\n'),
-      ');',
-    ].join('\n');
+    final createPrefix = persistence == 'Unlogged'
+        ? 'CREATE UNLOGGED TABLE'
+        : 'CREATE TABLE';
+    final statements = <String>[
+      [
+        '$createPrefix $qualifiedName (',
+        columnLines.join(',\n'),
+        relationType == 'Partitioned table' && viewDefinition.isNotEmpty
+            ? ')\nPARTITION BY $viewDefinition;'
+            : ');',
+      ].join('\n'),
+      for (final constraint in constraints)
+        'ALTER TABLE $qualifiedName\n'
+            '  ADD CONSTRAINT ${_quoteIdentifier(constraint.name)} '
+            '${constraint.definition};',
+      for (final foreignKey in foreignKeys)
+        'ALTER TABLE $qualifiedName\n'
+            '  ADD CONSTRAINT ${_quoteIdentifier(foreignKey.name)} '
+            '${foreignKey.definition};',
+      for (final index in indexes)
+        if (!index.constraintOwned) '${_withoutSemicolon(index.definition)};',
+      for (final trigger in triggers)
+        '${_withoutSemicolon(trigger.definition)};',
+      if (owner.isNotEmpty)
+        'ALTER TABLE $qualifiedName OWNER TO ${_quoteIdentifier(owner)};',
+      if (tablespace.isNotEmpty && tablespace != 'pg_default')
+        'ALTER TABLE $qualifiedName SET TABLESPACE ${_quoteIdentifier(tablespace)};',
+      if (comment.isNotEmpty)
+        'COMMENT ON TABLE $qualifiedName IS ${_quoteLiteral(comment)};',
+      for (final column in columns)
+        if (column.comment.isNotEmpty)
+          'COMMENT ON COLUMN $qualifiedName.${_quoteIdentifier(column.name)} '
+              'IS ${_quoteLiteral(column.comment)};',
+    ];
+    return statements.join('\n\n');
+  }
+
+  static String _columnDefinition(DatabaseColumn column) {
+    final buffer = StringBuffer()
+      ..write(_quoteIdentifier(column.name))
+      ..write(' ')
+      ..write(column.dataType);
+    if (column.identity.isNotEmpty) {
+      buffer.write(' GENERATED ${column.identity} AS IDENTITY');
+    } else if (column.generated.isNotEmpty && column.defaultValue.isNotEmpty) {
+      buffer.write(' GENERATED ALWAYS AS (${column.defaultValue}) STORED');
+    } else if (column.defaultValue.isNotEmpty) {
+      buffer.write(' DEFAULT ${column.defaultValue}');
+    }
+    if (!column.nullable) buffer.write(' NOT NULL');
+    return buffer.toString();
+  }
+
+  static String _withoutSemicolon(String value) {
+    final trimmed = value.trim();
+    return trimmed.endsWith(';')
+        ? trimmed.substring(0, trimmed.length - 1)
+        : trimmed;
+  }
+
+  static String _quoteLiteral(String value) {
+    return "'${value.replaceAll("'", "''")}'";
   }
 
   static String _quoteIdentifier(String identifier) {

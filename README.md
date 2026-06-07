@@ -1,17 +1,46 @@
-# db_viewer
+# QueryDock
 
-A new Flutter project.
+QueryDock is a cross-platform PostgreSQL workbench built with Flutter. It
+provides a database navigator, SQL editor and autocomplete, editable result
+grids, schema diagrams, connection protection, and optional AI-assisted query
+generation.
 
-## Getting Started
+## Download
 
-This project is a starting point for a Flutter application.
+Prebuilt Windows releases are available from the repository's
+[Releases](https://github.com/sanjayVontela/db-viewer/releases) page.
 
-A few resources to get you started if this is your first Flutter project:
+1. Download `QueryDock-vX.Y.Z-windows-x64.zip`.
+2. Extract the complete ZIP.
+3. Run `querydock.exe`.
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+Windows may display a SmartScreen warning until release binaries are signed
+with a trusted code-signing certificate.
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## Development
+
+```powershell
+flutter pub get
+flutter run -d windows
+```
+
+Run the checks before submitting a change:
+
+```powershell
+dart analyze
+flutter test
+```
+
+## Creating A Release
+
+Update the version in `pubspec.yaml`, commit the release, then push a version
+tag:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The release workflow builds and tests QueryDock on GitHub, packages the full
+Windows runtime, creates a SHA-256 checksum, and publishes both files under
+GitHub Releases.

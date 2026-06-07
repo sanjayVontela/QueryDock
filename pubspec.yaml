@@ -22,6 +22,7 @@ dependencies:
   shared_preferences: ^2.5.5
   flutter_secure_storage: ^10.3.1
   path_provider: ^2.1.5
+  pluto_grid: ^8.1.0
 
 
 dev_dependencies:
@@ -33,6 +34,10 @@ dev_dependencies:
 flutter:
 
   uses-material-design: true
+
+  assets:
+    - assets/branding/querydock_logo.png
+    - assets/branding/querydock_app_icon.png
 
   # assets:
   #   - images/a_dot_burr.jpeg

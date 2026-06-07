@@ -6,16 +6,10 @@
 
 namespace {
 
-bool IsRepeatedModifierKeyDown(UINT message, WPARAM key, LPARAM flags) {
-  if (message != WM_KEYDOWN && message != WM_SYSKEYDOWN) {
-    return false;
-  }
+constexpr wchar_t kFlutterWindowProperty[] =
+    L"QueryDock.FlutterWindow.KeyboardGuard";
 
-  const bool was_previously_down = (flags & (1LL << 30)) != 0;
-  if (!was_previously_down) {
-    return false;
-  }
-
+bool IsModifierKey(WPARAM key) {
   switch (key) {
     case VK_MENU:
     case VK_LMENU:
@@ -32,6 +26,26 @@ bool IsRepeatedModifierKeyDown(UINT message, WPARAM key, LPARAM flags) {
     default:
       return false;
   }
+}
+
+UINT PhysicalKeyId(WPARAM key, LPARAM flags) {
+  const UINT scan_code = (static_cast<UINT>(flags) >> 16) & 0xFF;
+  const UINT extended = (static_cast<UINT>(flags) >> 24) & 0x01;
+  return (scan_code << 1) | extended |
+         (static_cast<UINT>(key) << 16);
+}
+
+bool IsRepeatedModifierKeyDown(UINT message, WPARAM key, LPARAM flags) {
+  if (message != WM_KEYDOWN && message != WM_SYSKEYDOWN) {
+    return false;
+  }
+
+  const bool was_previously_down = (flags & (1LL << 30)) != 0;
+  if (!was_previously_down) {
+    return false;
+  }
+
+  return IsModifierKey(key);
 }
 
 }  // namespace
@@ -57,7 +71,18 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
-  SetChildContent(flutter_controller_->view()->GetNativeWindow());
+  flutter_view_window_ = flutter_controller_->view()->GetNativeWindow();
+  SetChildContent(flutter_view_window_);
+
+  SetProp(flutter_view_window_, kFlutterWindowProperty, this);
+  original_flutter_view_proc_ = reinterpret_cast<WNDPROC>(SetWindowLongPtr(
+      flutter_view_window_, GWLP_WNDPROC,
+      reinterpret_cast<LONG_PTR>(&FlutterWindow::FlutterViewWindowProc)));
+  if (!original_flutter_view_proc_) {
+    RemoveProp(flutter_view_window_, kFlutterWindowProperty);
+    flutter_view_window_ = nullptr;
+    return false;
+  }
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -72,6 +97,15 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  ResetPhysicalKeyState();
+  if (flutter_view_window_ && original_flutter_view_proc_) {
+    SetWindowLongPtr(flutter_view_window_, GWLP_WNDPROC,
+                     reinterpret_cast<LONG_PTR>(original_flutter_view_proc_));
+    RemoveProp(flutter_view_window_, kFlutterWindowProperty);
+  }
+  flutter_view_window_ = nullptr;
+  original_flutter_view_proc_ = nullptr;
+
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -83,6 +117,10 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (message == WM_ACTIVATEAPP && !wparam) {
+    ResetPhysicalKeyState();
+  }
+
   // Windows may emit auto-repeat messages for a held modifier. Some Flutter
   // engine versions classify those as another KeyDownEvent instead of a
   // KeyRepeatEvent, which violates HardwareKeyboard's state invariant.
@@ -107,4 +145,50 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+}
+
+LRESULT CALLBACK FlutterWindow::FlutterViewWindowProc(
+    HWND window, UINT const message, WPARAM const wparam,
+    LPARAM const lparam) noexcept {
+  auto* flutter_window = reinterpret_cast<FlutterWindow*>(
+      GetProp(window, kFlutterWindowProperty));
+  if (!flutter_window) {
+    return DefWindowProc(window, message, wparam, lparam);
+  }
+  return flutter_window->HandleFlutterViewMessage(window, message, wparam,
+                                                  lparam);
+}
+
+LRESULT FlutterWindow::HandleFlutterViewMessage(
+    HWND window, UINT const message, WPARAM const wparam,
+    LPARAM const lparam) noexcept {
+  if (message == WM_KILLFOCUS || message == WM_CANCELMODE) {
+    ResetPhysicalKeyState();
+  } else if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+    const UINT key_id = PhysicalKeyId(wparam, lparam);
+    if (!pressed_physical_keys_.insert(key_id).second) {
+      if (IsModifierKey(wparam)) {
+        return 0;
+      }
+
+      // Some Windows/Flutter combinations report an auto-repeat as another
+      // KeyDownEvent. Repair the sequence so HardwareKeyboard receives a
+      // regular up/down pair while held letters, arrows, and Backspace still
+      // repeat normally.
+      const UINT key_up_message =
+          message == WM_SYSKEYDOWN ? WM_SYSKEYUP : WM_KEYUP;
+      const LPARAM key_up_flags = lparam | (1LL << 30) | (1LL << 31);
+      CallWindowProc(original_flutter_view_proc_, window, key_up_message,
+                     wparam, key_up_flags);
+    }
+  } else if (message == WM_KEYUP || message == WM_SYSKEYUP) {
+    pressed_physical_keys_.erase(PhysicalKeyId(wparam, lparam));
+  }
+
+  return CallWindowProc(original_flutter_view_proc_, window, message, wparam,
+                        lparam);
+}
+
+void FlutterWindow::ResetPhysicalKeyState() {
+  pressed_physical_keys_.clear();
 }

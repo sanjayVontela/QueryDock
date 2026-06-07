@@ -13,6 +13,7 @@ class DBViewer extends StatelessWidget {
       builder: (context, themeMode, child) {
         return MaterialApp(
           title: 'QueryDock',
+          debugShowCheckedModeBanner: false,
           themeMode: themeMode,
           theme: _theme(Brightness.light),
           darkTheme: _theme(Brightness.dark),
