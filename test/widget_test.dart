@@ -57,9 +57,10 @@ void main() {
     await tester.pump();
     expect(find.byType(TextField), findsNothing);
 
-    await tester.tap(find.text('1'));
+    final editableValue = find.text('1').last;
+    await tester.tap(editableValue);
     await tester.pump(const Duration(milliseconds: 50));
-    await tester.tap(find.text('1'));
+    await tester.tap(editableValue);
     await tester.pump();
     expect(find.byType(TextField), findsOneWidget);
     await tester.pump(const Duration(milliseconds: 400));

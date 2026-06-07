@@ -889,6 +889,7 @@ class EditorTab extends StatelessWidget {
   final bool active;
   final VoidCallback? onTap;
   final VoidCallback? onClose;
+  final GestureTapDownCallback? onSecondaryTapDown;
 
   const EditorTab({
     super.key,
@@ -896,12 +897,14 @@ class EditorTab extends StatelessWidget {
     required this.active,
     this.onTap,
     this.onClose,
+    this.onSecondaryTapDown,
   });
 
   @override
   Widget build(BuildContext context) {
     return InkWell(
       onTap: onTap,
+      onSecondaryTapDown: onSecondaryTapDown,
       child: Container(
         height: 34,
         padding: const EdgeInsets.only(left: 14, right: 8),
@@ -1047,6 +1050,7 @@ class _ResultGridState extends State<ResultGrid> {
   static const _defaultColumnWidth = 150.0;
   static const _minimumColumnWidth = 80.0;
   static const _maximumColumnWidth = 600.0;
+  static const _rowNumberWidth = 54.0;
   final ScrollController _horizontalController = ScrollController();
   final ScrollController _verticalController = ScrollController();
   final Map<String, double> _columnWidths = {};
@@ -1123,7 +1127,7 @@ class _ResultGridState extends State<ResultGrid> {
       _columnWidths[widget.columns[index]] ?? _defaultColumnWidth;
 
   double _columnLeft(int index) {
-    var left = 0.0;
+    var left = _rowNumberWidth;
     for (var current = 0; current < index; current++) {
       left += _columnWidth(current);
     }
@@ -1131,7 +1135,7 @@ class _ResultGridState extends State<ResultGrid> {
   }
 
   double get _gridWidth {
-    var width = 0.0;
+    var width = _rowNumberWidth;
     for (var index = 0; index < widget.columns.length; index++) {
       width += _columnWidth(index);
     }
@@ -1237,6 +1241,17 @@ class _ResultGridState extends State<ResultGrid> {
                     color: Theme.of(context).colorScheme.surfaceContainerHigh,
                     child: Stack(
                       children: [
+                        Positioned(
+                          left: 0,
+                          width: _rowNumberWidth,
+                          top: 0,
+                          bottom: 0,
+                          child: _FastGridCell(
+                            text: '#',
+                            header: true,
+                            width: _rowNumberWidth,
+                          ),
+                        ),
                         for (final columnIndex in visibleColumns)
                           Positioned(
                             left: _columnLeft(columnIndex),
@@ -1319,6 +1334,20 @@ class _ResultGridState extends State<ResultGrid> {
                         return RepaintBoundary(
                           child: Stack(
                             children: [
+                              Positioned(
+                                left: 0,
+                                width: _rowNumberWidth,
+                                top: 0,
+                                bottom: 0,
+                                child: _FastGridCell(
+                                  key: ValueKey(
+                                    'result-grid-row-number-$rowIndex',
+                                  ),
+                                  text: '${rowIndex + 1}',
+                                  width: _rowNumberWidth,
+                                  numeric: true,
+                                ),
+                              ),
                               for (final columnIndex in visibleColumns)
                                 Positioned(
                                   left: _columnLeft(columnIndex),
@@ -1414,6 +1443,7 @@ class _PlutoResultGrid extends StatefulWidget {
 }
 
 class _PlutoResultGridState extends State<_PlutoResultGrid> {
+  static const _rowNumberField = 'querydock_row_number';
   PlutoGridStateManager? _stateManager;
   ScrollController? _verticalController;
   late List<PlutoColumn> _columns;
@@ -1466,6 +1496,39 @@ class _PlutoResultGridState extends State<_PlutoResultGrid> {
 
   List<PlutoColumn> _buildColumns() {
     return [
+      PlutoColumn(
+        title: '#',
+        field: _rowNumberField,
+        type: PlutoColumnType.number(),
+        width: 58,
+        minWidth: 58,
+        readOnly: true,
+        frozen: PlutoColumnFrozen.start,
+        enableEditingMode: false,
+        enableSorting: false,
+        enableColumnDrag: false,
+        enableDropToResize: false,
+        enableContextMenu: false,
+        enableFilterMenuItem: false,
+        textAlign: PlutoColumnTextAlign.right,
+        titleTextAlign: PlutoColumnTextAlign.right,
+        renderer: (rendererContext) => Container(
+          key: ValueKey(
+            'pluto-result-grid-row-number-${rendererContext.row.sortIdx}',
+          ),
+          alignment: Alignment.centerRight,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          color: Theme.of(context).colorScheme.surfaceContainerLow,
+          child: Text(
+            '${rendererContext.row.sortIdx + 1}',
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+              fontFamily: 'Consolas',
+              fontSize: 11,
+            ),
+          ),
+        ),
+      ),
       for (var index = 0; index < result.columns.length; index++)
         PlutoColumn(
           title: result.columns[index],
@@ -1550,6 +1613,7 @@ class _PlutoResultGridState extends State<_PlutoResultGrid> {
         PlutoRow(
           sortIdx: row,
           cells: {
+            _rowNumberField: PlutoCell(value: row + 1),
             for (var column = 0; column < result.columns.length; column++)
               _field(column): PlutoCell(value: _cellValue(row, column)),
           },
@@ -1568,6 +1632,7 @@ class _PlutoResultGridState extends State<_PlutoResultGrid> {
   String _field(int column) => 'querydock_column_$column';
 
   int _columnIndex(String field) {
+    if (field == _rowNumberField) return -1;
     return int.tryParse(field.substring(field.lastIndexOf('_') + 1)) ?? 0;
   }
 
@@ -1640,6 +1705,7 @@ class _PlutoResultGridState extends State<_PlutoResultGrid> {
         : result.rows.length;
     for (var row = 0; row < rowCount; row++) {
       managedRows[row].sortIdx = row;
+      managedRows[row].cells[_rowNumberField]?.value = row + 1;
       for (var column = 0; column < result.columns.length; column++) {
         final cell = managedRows[row].cells[_field(column)];
         final value = _cellValue(row, column);
@@ -1715,6 +1781,7 @@ class _PlutoResultGridState extends State<_PlutoResultGrid> {
           onChanged: (event) {
             final row = event.row.sortIdx;
             final column = _columnIndex(event.column.field);
+            if (column < 0) return;
             result.onCellChanged?.call(
               row,
               column,
@@ -1851,8 +1918,10 @@ class _FastGridCell extends StatelessWidget {
   final VoidCallback? onFilter;
   final VoidCallback? onDoubleTap;
   final bool edited;
+  final bool numeric;
 
   const _FastGridCell({
+    super.key,
     required this.text,
     this.header = false,
     required this.width,
@@ -1865,6 +1934,7 @@ class _FastGridCell extends StatelessWidget {
     this.onFilter,
     this.onDoubleTap,
     this.edited = false,
+    this.numeric = false,
   });
 
   @override
@@ -1876,7 +1946,7 @@ class _FastGridCell extends StatelessWidget {
         width: width,
         height: header ? 34 : 32,
         padding: const EdgeInsets.symmetric(horizontal: 8),
-        alignment: Alignment.centerLeft,
+        alignment: numeric ? Alignment.centerRight : Alignment.centerLeft,
         decoration: BoxDecoration(
           color: edited
               ? Theme.of(context).colorScheme.tertiaryContainer

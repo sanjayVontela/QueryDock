@@ -47,11 +47,13 @@ class _MyHomePageState extends State<MyHomePage> {
       const AiAssistantSettingsStore();
   final AiAssistantClient _aiClient = AiAssistantClient();
   final TextEditingController _aiPromptController = TextEditingController();
+  final ScrollController _centerTabsController = ScrollController();
 
   PostgresDatabase? _database;
   PostgresDatabase? _executingDatabase;
   bool _isExecuting = false;
   bool _cancelRequested = false;
+  String? _loadingOperation;
   bool _isConnecting = false;
   bool _showAllSqlScripts = false;
   bool _aiSending = false;
@@ -124,6 +126,7 @@ class _MyHomePageState extends State<MyHomePage> {
     }
     _activeResultTab.dispose();
     _aiPromptController.dispose();
+    _centerTabsController.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -825,6 +828,7 @@ class _MyHomePageState extends State<MyHomePage> {
       databaseOverride: database,
       editorText: tab?.controller.text,
       editorOffset: execution.offset,
+      loadingOperation: 'Executing SQL...',
     );
   }
 
@@ -834,6 +838,7 @@ class _MyHomePageState extends State<MyHomePage> {
     PostgresDatabase? databaseOverride,
     String? editorText,
     int editorOffset = 0,
+    String? loadingOperation,
   }) async {
     final database = databaseOverride ?? _database;
 
@@ -869,6 +874,7 @@ class _MyHomePageState extends State<MyHomePage> {
       _isExecuting = true;
       _executingDatabase = database;
       _cancelRequested = false;
+      _loadingOperation = loadingOperation;
       _activeSqlTab?.error = null;
       _logs.add('[INFO] Executing SQL...');
       _logs.add('[SQL] ${_sqlSummary(sql)}');
@@ -925,6 +931,7 @@ class _MyHomePageState extends State<MyHomePage> {
         _isExecuting = false;
         _executingDatabase = null;
         _cancelRequested = false;
+        _loadingOperation = null;
         _logs.add('[INFO] Query executed successfully');
         _logs.add(
           '[INFO] ${result.rowCount} rows fetched, ${result.affectedRows} affected in ${result.elapsed.inMilliseconds} ms',
@@ -948,6 +955,7 @@ class _MyHomePageState extends State<MyHomePage> {
         _executingDatabase = null;
         final wasCancelled = _cancelRequested;
         _cancelRequested = false;
+        _loadingOperation = null;
         if (updateSqlResults && error is PostgresQueryException) {
           _activeSqlTab?.error = _SqlEditorError.fromPostgresException(
             editorText ?? sql,
@@ -1227,6 +1235,7 @@ class _MyHomePageState extends State<MyHomePage> {
       _activeCenterTab = _sqlTabs.length - 1;
       _logs.add('[INFO] Created SQL script: ${script.title}');
     });
+    _revealLastCenterTab();
   }
 
   Future<void> _selectSqlScript() async {
@@ -1267,6 +1276,7 @@ class _MyHomePageState extends State<MyHomePage> {
       }
       _logs.add('[INFO] Opened SQL script: ${selected.file.path}');
     });
+    _revealLastCenterTab();
   }
 
   Future<Directory> _sqlScriptsRootDirectory() async {
@@ -1820,6 +1830,9 @@ class _MyHomePageState extends State<MyHomePage> {
       _activeSchema = schema;
       _logs.add('[INFO] Opened data browser: $schema.${table.name}');
     });
+    if (existingIndex == -1) {
+      _revealLastCenterTab();
+    }
 
     await _loadTableTabData(tab);
   }
@@ -2213,6 +2226,7 @@ class _MyHomePageState extends State<MyHomePage> {
       _buildTableDataSql(tab, offset: offset),
       updateSqlResults: false,
       databaseOverride: tab.database,
+      loadingOperation: reset ? 'Loading ${tab.schema}.${tab.table}...' : null,
     );
     if (result == null) {
       if (mounted) setState(() => tab.loadingPage = false);
@@ -2950,24 +2964,231 @@ class _MyHomePageState extends State<MyHomePage> {
       color: Theme.of(context).colorScheme.surfaceContainer,
       child: Row(
         children: [
-          for (int i = 0; i < _sqlTabs.length; i++)
-            EditorTab(
-              title: _sqlTabs[i].title,
-              active: _activeCenterTab == i,
-              onTap: () => setState(() => _activeCenterTab = i),
-              onClose: () => _closeSqlTab(_sqlTabs[i]),
+          _CenterTabScrollButton(
+            tooltip: 'Scroll tabs left',
+            icon: Icons.chevron_left,
+            onPressed: () => _scrollCenterTabs(-220),
+          ),
+          Expanded(
+            child: SingleChildScrollView(
+              key: const ValueKey('center-tab-scroll-view'),
+              controller: _centerTabsController,
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (int i = 0; i < _sqlTabs.length; i++)
+                    EditorTab(
+                      title: _sqlTabs[i].title,
+                      active: _activeCenterTab == i,
+                      onTap: () => setState(() => _activeCenterTab = i),
+                      onClose: () => _closeSqlTab(_sqlTabs[i]),
+                      onSecondaryTapDown: (details) =>
+                          _showCenterTabMenu(i, details.globalPosition),
+                    ),
+                  for (int i = 0; i < _openTableTabs.length; i++)
+                    EditorTab(
+                      title: _openTableTabs[i].table,
+                      active: _activeCenterTab == _tableTabOffset + i,
+                      onTap: () => setState(
+                        () => _activeCenterTab = _tableTabOffset + i,
+                      ),
+                      onClose: () => _closeTableTab(_openTableTabs[i]),
+                      onSecondaryTapDown: (details) => _showCenterTabMenu(
+                        _tableTabOffset + i,
+                        details.globalPosition,
+                      ),
+                    ),
+                ],
+              ),
             ),
-          for (int i = 0; i < _openTableTabs.length; i++)
-            EditorTab(
-              title: _openTableTabs[i].table,
-              active: _activeCenterTab == _tableTabOffset + i,
-              onTap: () =>
-                  setState(() => _activeCenterTab = _tableTabOffset + i),
-              onClose: () => _closeTableTab(_openTableTabs[i]),
-            ),
+          ),
+          _CenterTabScrollButton(
+            tooltip: 'Scroll tabs right',
+            icon: Icons.chevron_right,
+            onPressed: () => _scrollCenterTabs(220),
+          ),
         ],
       ),
     );
+  }
+
+  void _scrollCenterTabs(double delta) {
+    if (!_centerTabsController.hasClients) return;
+    final position = _centerTabsController.position;
+    final target = (_centerTabsController.offset + delta).clamp(
+      position.minScrollExtent,
+      position.maxScrollExtent,
+    );
+    _centerTabsController.animateTo(
+      target,
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOut,
+    );
+  }
+
+  void _revealLastCenterTab() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_centerTabsController.hasClients) return;
+      _centerTabsController.animateTo(
+        _centerTabsController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  Future<void> _showCenterTabMenu(int tabIndex, Offset position) async {
+    final tabCount = _sqlTabs.length + _openTableTabs.length;
+    if (tabIndex < 0 || tabIndex >= tabCount) return;
+
+    setState(() {
+      _activeCenterTab = tabIndex;
+    });
+
+    final action = await showMenu<_CenterTabAction>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: [
+        const PopupMenuItem(
+          value: _CenterTabAction.close,
+          child: _TabMenuCommand(
+            icon: Icons.close,
+            label: 'Close',
+            shortcut: 'Ctrl+W',
+          ),
+        ),
+        PopupMenuItem(
+          value: _CenterTabAction.closeOthers,
+          enabled: tabCount > 1,
+          child: const _TabMenuCommand(
+            icon: Icons.filter_center_focus,
+            label: 'Close Others',
+          ),
+        ),
+        PopupMenuItem(
+          value: _CenterTabAction.closeAll,
+          enabled: tabCount > 0,
+          child: const _TabMenuCommand(
+            icon: Icons.close_fullscreen,
+            label: 'Close All',
+          ),
+        ),
+        const PopupMenuDivider(),
+        PopupMenuItem(
+          value: _CenterTabAction.closeLeft,
+          enabled: tabIndex > 0,
+          child: const _TabMenuCommand(
+            icon: Icons.keyboard_double_arrow_left,
+            label: 'Close Tabs to the Left',
+          ),
+        ),
+        PopupMenuItem(
+          value: _CenterTabAction.closeRight,
+          enabled: tabIndex < tabCount - 1,
+          child: const _TabMenuCommand(
+            icon: Icons.keyboard_double_arrow_right,
+            label: 'Close Tabs to the Right',
+          ),
+        ),
+      ],
+    );
+    if (!mounted || action == null) return;
+
+    final indexes = switch (action) {
+      _CenterTabAction.close => {tabIndex},
+      _CenterTabAction.closeOthers => {
+        for (var index = 0; index < tabCount; index++)
+          if (index != tabIndex) index,
+      },
+      _CenterTabAction.closeAll => {
+        for (var index = 0; index < tabCount; index++) index,
+      },
+      _CenterTabAction.closeLeft => {
+        for (var index = 0; index < tabIndex; index++) index,
+      },
+      _CenterTabAction.closeRight => {
+        for (var index = tabIndex + 1; index < tabCount; index++) index,
+      },
+    };
+    _closeCenterTabs(indexes);
+  }
+
+  void _closeCenterTabs(Set<int> indexes) {
+    if (indexes.isEmpty) return;
+
+    final allTabs = <Object>[..._sqlTabs, ..._openTableTabs];
+    final validIndexes = indexes
+        .where((index) => index >= 0 && index < allTabs.length)
+        .toSet();
+    if (validIndexes.isEmpty) return;
+
+    final activeIndex = _activeCenterTab.clamp(0, allTabs.length - 1);
+    final activeTab = allTabs[activeIndex];
+    final removedSqlTabs = <_SqlScriptTab>[];
+    final removedTableTabs = <_OpenTableTab>[];
+
+    for (final index in validIndexes) {
+      final tab = allTabs[index];
+      if (tab is _SqlScriptTab) {
+        removedSqlTabs.add(tab);
+      } else if (tab is _OpenTableTab) {
+        removedTableTabs.add(tab);
+      }
+    }
+
+    final survivingTabs = [
+      for (var index = 0; index < allTabs.length; index++)
+        if (!validIndexes.contains(index)) allTabs[index],
+    ];
+    Object? nextActiveTab;
+    if (survivingTabs.contains(activeTab)) {
+      nextActiveTab = activeTab;
+    } else if (survivingTabs.isNotEmpty) {
+      final nextIndex = [
+        for (var index = activeIndex + 1; index < allTabs.length; index++)
+          if (!validIndexes.contains(index)) index,
+      ].firstOrNull;
+      if (nextIndex != null) {
+        nextActiveTab = allTabs[nextIndex];
+      } else {
+        final previousIndex = [
+          for (var index = activeIndex - 1; index >= 0; index--)
+            if (!validIndexes.contains(index)) index,
+        ].firstOrNull;
+        if (previousIndex != null) {
+          nextActiveTab = allTabs[previousIndex];
+        }
+      }
+    }
+
+    setState(() {
+      _sqlTabs.removeWhere(removedSqlTabs.contains);
+      _openTableTabs.removeWhere(removedTableTabs.contains);
+      if (nextActiveTab == null) {
+        _activeCenterTab = 0;
+      } else if (nextActiveTab is _SqlScriptTab) {
+        _activeCenterTab = _sqlTabs.indexOf(nextActiveTab);
+      } else {
+        _activeCenterTab =
+            _tableTabOffset +
+            _openTableTabs.indexOf(nextActiveTab as _OpenTableTab);
+      }
+      _logs.add('[INFO] Closed ${validIndexes.length} editor tab(s)');
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      for (final tab in removedSqlTabs) {
+        tab.dispose();
+      }
+      for (final tab in removedTableTabs) {
+        tab.dispose();
+      }
+    });
   }
 
   Widget _buildNavigatorPanel(double animationProgress) {
@@ -3131,104 +3352,163 @@ class _MyHomePageState extends State<MyHomePage> {
       return _buildEmptyEditorPanel();
     }
 
-    return Column(
-      children: [
-        _buildCenterTabs(),
-        Expanded(
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final maxResultHeight = (constraints.maxHeight - 140).clamp(
-                0.0,
-                constraints.maxHeight,
-              );
-              final minResultHeight = maxResultHeight < 120
-                  ? maxResultHeight
-                  : 120.0;
-              final resultHeight = _resultPanelHeight.clamp(
-                minResultHeight,
-                maxResultHeight,
-              );
-              return Column(
-                children: [
-                  Expanded(child: _buildSqlEditorSurface(sqlTab)),
-                  MouseRegion(
-                    cursor: SystemMouseCursors.resizeRow,
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onVerticalDragUpdate: (details) {
-                        setState(() {
-                          _resultPanelHeight =
-                              (_resultPanelHeight - details.delta.dy).clamp(
-                                minResultHeight,
-                                maxResultHeight,
-                              );
-                        });
-                      },
-                      child: Container(
-                        height: 7,
-                        color: Theme.of(context).dividerColor,
-                        alignment: Alignment.center,
+    return _withLoadingOverlay(
+      Column(
+        children: [
+          _buildCenterTabs(),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final maxResultHeight = (constraints.maxHeight - 140).clamp(
+                  0.0,
+                  constraints.maxHeight,
+                );
+                final minResultHeight = maxResultHeight < 120
+                    ? maxResultHeight
+                    : 120.0;
+                final resultHeight = _resultPanelHeight.clamp(
+                  minResultHeight,
+                  maxResultHeight,
+                );
+                return Column(
+                  children: [
+                    Expanded(child: _buildSqlEditorSurface(sqlTab)),
+                    MouseRegion(
+                      cursor: SystemMouseCursors.resizeRow,
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onVerticalDragUpdate: (details) {
+                          setState(() {
+                            _resultPanelHeight =
+                                (_resultPanelHeight - details.delta.dy).clamp(
+                                  minResultHeight,
+                                  maxResultHeight,
+                                );
+                          });
+                        },
                         child: Container(
-                          width: 36,
-                          height: 2,
-                          color: Theme.of(context).colorScheme.outline,
+                          height: 7,
+                          color: Theme.of(context).dividerColor,
+                          alignment: Alignment.center,
+                          child: Container(
+                            width: 36,
+                            height: 2,
+                            color: Theme.of(context).colorScheme.outline,
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                  SizedBox(
-                    height: resultHeight,
-                    child: Column(
-                      children: [
-                        _buildResultHeader(),
-                        Expanded(
-                          child: Container(
-                            color: Theme.of(context).colorScheme.surface,
-                            child: _buildResultContent(),
+                    SizedBox(
+                      height: resultHeight,
+                      child: Column(
+                        children: [
+                          _buildResultHeader(),
+                          Expanded(
+                            child: Container(
+                              color: Theme.of(context).colorScheme.surface,
+                              child: _buildResultContent(),
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
-                ],
-              );
-            },
+                  ],
+                );
+              },
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 
   Widget _buildEmptyEditorPanel() {
-    return Column(
-      children: [
-        _buildCenterTabs(),
-        Expanded(
-          child: Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.code_off_outlined,
-                  size: 34,
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-                const SizedBox(height: 10),
-                const Text(
-                  'No editors open',
-                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 10),
-                FilledButton.icon(
-                  key: const ValueKey('empty-editor-new-sql'),
-                  onPressed: () => unawaited(_newSqlScript()),
-                  icon: const Icon(Icons.add, size: 17),
-                  label: const Text('New SQL'),
-                ),
-              ],
+    return _withLoadingOverlay(
+      Column(
+        children: [
+          _buildCenterTabs(),
+          Expanded(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.code_off_outlined,
+                    size: 34,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(height: 10),
+                  const Text(
+                    'No editors open',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 10),
+                  FilledButton.icon(
+                    key: const ValueKey('empty-editor-new-sql'),
+                    onPressed: () => unawaited(_newSqlScript()),
+                    icon: const Icon(Icons.add, size: 17),
+                    label: const Text('New SQL'),
+                  ),
+                ],
+              ),
             ),
           ),
-        ),
+        ],
+      ),
+    );
+  }
+
+  Widget _withLoadingOverlay(Widget child) {
+    final operation = _loadingOperation;
+    return Stack(
+      children: [
+        Positioned.fill(child: child),
+        if (operation != null)
+          Positioned.fill(
+            child: ColoredBox(
+              color: Theme.of(
+                context,
+              ).colorScheme.scrim.withValues(alpha: 0.28),
+              child: Center(
+                child: Material(
+                  elevation: 8,
+                  color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                  borderRadius: BorderRadius.circular(6),
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(minWidth: 240),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 22,
+                        vertical: 18,
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const SizedBox(
+                            width: 26,
+                            height: 26,
+                            child: CircularProgressIndicator(strokeWidth: 3),
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            _cancelRequested ? 'Cancelling...' : operation,
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                          const SizedBox(height: 12),
+                          OutlinedButton.icon(
+                            key: const ValueKey('cancel-loading-operation'),
+                            onPressed: _cancelRequested ? null : _stopQuery,
+                            icon: const Icon(Icons.stop, size: 17),
+                            label: const Text('Cancel'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
       ],
     );
   }
@@ -3449,6 +3729,8 @@ class _MyHomePageState extends State<MyHomePage> {
               controller: sqlTab.controller,
               focusNode: sqlTab.focusNode,
               error: sqlTab.error,
+              onDismissError: () => setState(() => sqlTab.error = null),
+              onExecute: _executeShortcut,
               aiSuggestion: sqlTab.aiSuggestion,
               onAcceptAiSuggestion: () => _acceptAiCompletion(sqlTab),
               onDismissAiSuggestion: () =>
@@ -4807,6 +5089,8 @@ class _SqlCodeEditor extends StatefulWidget {
   final _SqlCodeController controller;
   final FocusNode focusNode;
   final _SqlEditorError? error;
+  final VoidCallback onDismissError;
+  final VoidCallback onExecute;
   final String? aiSuggestion;
   final VoidCallback onAcceptAiSuggestion;
   final VoidCallback onDismissAiSuggestion;
@@ -4817,6 +5101,8 @@ class _SqlCodeEditor extends StatefulWidget {
     required this.controller,
     required this.focusNode,
     required this.error,
+    required this.onDismissError,
+    required this.onExecute,
     required this.aiSuggestion,
     required this.onAcceptAiSuggestion,
     required this.onDismissAiSuggestion,
@@ -4838,6 +5124,7 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
   List<_SqlCompletion> _options = const [];
   int _highlightedIndex = -1;
   bool _suppressNextChange = false;
+  bool _caretScrollScheduled = false;
 
   @override
   void initState() {
@@ -4882,6 +5169,7 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
   }
 
   void _updateOptions() {
+    _scheduleCaretVisibility();
     if (_suppressNextChange) {
       _suppressNextChange = false;
       return;
@@ -4899,6 +5187,12 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
   KeyEventResult _handleKeyEvent(KeyEvent event) {
     if (event is! KeyDownEvent) {
       return KeyEventResult.ignored;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.enter &&
+        HardwareKeyboard.instance.isControlPressed) {
+      widget.onExecute();
+      return KeyEventResult.handled;
     }
 
     if (_options.isNotEmpty &&
@@ -4946,6 +5240,58 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
     }
 
     return KeyEventResult.ignored;
+  }
+
+  void _scheduleCaretVisibility() {
+    if (_caretScrollScheduled) return;
+    _caretScrollScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _caretScrollScheduled = false;
+      if (!mounted) return;
+      _ensureCaretVisible();
+    });
+  }
+
+  void _ensureCaretVisible() {
+    final selection = widget.controller.selection;
+    if (!selection.isValid) return;
+
+    final cursor = selection.extentOffset.clamp(
+      0,
+      widget.controller.text.length,
+    );
+    final textBeforeCursor = widget.controller.text.substring(0, cursor);
+    final line = '\n'.allMatches(textBeforeCursor).length;
+    final caretTop = 10.0 + line * (_textStyle.fontSize! * _textStyle.height!);
+    final caretBottom = caretTop + (_textStyle.fontSize! * _textStyle.height!);
+
+    final positions = <ScrollPosition>[];
+    void collect(Element element) {
+      if (element is StatefulElement && element.state is ScrollableState) {
+        final state = element.state as ScrollableState;
+        final position = state.position;
+        if (position.axis == Axis.vertical && position.hasPixels) {
+          positions.add(position);
+        }
+      }
+      element.visitChildren(collect);
+    }
+
+    (context as Element).visitChildren(collect);
+    for (final position in positions) {
+      final visibleTop = position.pixels;
+      final visibleBottom = visibleTop + position.viewportDimension;
+      double? target;
+      if (caretBottom > visibleBottom - 12) {
+        target = caretBottom - position.viewportDimension + 12;
+      } else if (caretTop < visibleTop + 8) {
+        target = caretTop - 8;
+      }
+      if (target == null) continue;
+      position.jumpTo(
+        target.clamp(position.minScrollExtent, position.maxScrollExtent),
+      );
+    }
   }
 
   void _select(_SqlCompletion option) {
@@ -5146,6 +5492,25 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
                               context,
                             ).colorScheme.onErrorContainer,
                             fontSize: 12,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      SizedBox(
+                        width: 26,
+                        height: 26,
+                        child: IconButton(
+                          key: const ValueKey('dismiss-sql-error'),
+                          tooltip: 'Dismiss error',
+                          onPressed: widget.onDismissError,
+                          padding: EdgeInsets.zero,
+                          visualDensity: VisualDensity.compact,
+                          icon: Icon(
+                            Icons.close,
+                            size: 16,
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onErrorContainer,
                           ),
                         ),
                       ),
@@ -6062,6 +6427,68 @@ class _CompactResultTab extends StatelessWidget {
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
       ),
       icon: Icon(icon, size: 17),
+    );
+  }
+}
+
+enum _CenterTabAction { close, closeOthers, closeAll, closeLeft, closeRight }
+
+class _TabMenuCommand extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String? shortcut;
+
+  const _TabMenuCommand({
+    required this.icon,
+    required this.label,
+    this.shortcut,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Icon(icon, size: 17),
+        const SizedBox(width: 10),
+        Expanded(child: Text(label)),
+        if (shortcut != null) ...[
+          const SizedBox(width: 24),
+          Text(
+            shortcut!,
+            style: TextStyle(
+              fontSize: 11,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _CenterTabScrollButton extends StatelessWidget {
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  const _CenterTabScrollButton({
+    required this.tooltip,
+    required this.icon,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 28,
+      height: 34,
+      child: IconButton(
+        tooltip: tooltip,
+        onPressed: onPressed,
+        padding: EdgeInsets.zero,
+        visualDensity: VisualDensity.compact,
+        icon: Icon(icon, size: 18),
+      ),
     );
   }
 }

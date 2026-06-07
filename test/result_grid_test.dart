@@ -3,6 +3,47 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  for (final renderer in ResultGridRenderer.values) {
+    testWidgets('${renderer.name} displays row numbers', (tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 500,
+              height: 260,
+              child: ResultGrid(
+                renderer: renderer,
+                columns: const ['name'],
+                rows: const [
+                  ['Ada'],
+                  ['Grace'],
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final firstRowKey = renderer == ResultGridRenderer.pluto
+          ? const ValueKey('pluto-result-grid-row-number-0')
+          : const ValueKey('result-grid-row-number-0');
+      final secondRowKey = renderer == ResultGridRenderer.pluto
+          ? const ValueKey('pluto-result-grid-row-number-1')
+          : const ValueKey('result-grid-row-number-1');
+      expect(find.byKey(firstRowKey), findsOneWidget);
+      expect(find.byKey(secondRowKey), findsOneWidget);
+      expect(
+        find.descendant(of: find.byKey(firstRowKey), matching: find.text('1')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(of: find.byKey(secondRowKey), matching: find.text('2')),
+        findsOneWidget,
+      );
+    });
+  }
+
   testWidgets('result grid columns can be resized from the header edge', (
     tester,
   ) async {
