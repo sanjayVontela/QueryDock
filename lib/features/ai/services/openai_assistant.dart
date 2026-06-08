@@ -88,11 +88,27 @@ class AiAssistantMessage {
 
 class AiAssistantClient {
   static const _endpoint = 'https://api.openai.com/v1/responses';
+  int _requestSequence = 0;
+  int? _activeRequest;
+  final Set<int> _cancelledRequests = {};
+  HttpClient? _activeHttpClient;
+  Process? _activeProcess;
+
+  bool get isRunning => _activeRequest != null;
+
+  void cancel() {
+    final request = _activeRequest;
+    if (request == null) return;
+    _cancelledRequests.add(request);
+    _activeHttpClient?.close(force: true);
+    _activeProcess?.kill();
+  }
 
   Future<String> respond({
     required AiAssistantSettings settings,
     required List<AiAssistantMessage> conversation,
     required String context,
+    String databaseEngine = 'SQL',
   }) async {
     if (!settings.configured) {
       throw AiAssistantException(
@@ -106,28 +122,48 @@ class AiAssistantClient {
     final recentConversation = conversation
         .skip(conversation.length > 12 ? conversation.length - 12 : 0)
         .toList();
-    if (settings.provider == AiProvider.githubCopilot) {
-      return _respondWithCopilot(
-        settings: settings,
-        conversation: recentConversation,
-        context: contextText,
-      );
+    final requestId = ++_requestSequence;
+    _activeRequest = requestId;
+    try {
+      final response = settings.provider == AiProvider.githubCopilot
+          ? await _respondWithCopilot(
+              settings: settings,
+              conversation: recentConversation,
+              context: contextText,
+              databaseEngine: databaseEngine,
+              requestId: requestId,
+            )
+          : await _respondWithOpenAi(
+              settings: settings,
+              conversation: recentConversation,
+              context: contextText,
+              databaseEngine: databaseEngine,
+              requestId: requestId,
+            );
+      _throwIfCancelled(requestId);
+      return response;
+    } finally {
+      _cancelledRequests.remove(requestId);
+      if (_activeRequest == requestId) {
+        _activeRequest = null;
+        _activeHttpClient = null;
+        _activeProcess = null;
+      }
     }
-    return _respondWithOpenAi(
-      settings: settings,
-      conversation: recentConversation,
-      context: contextText,
-    );
   }
 
   Future<String> _respondWithOpenAi({
     required AiAssistantSettings settings,
     required List<AiAssistantMessage> conversation,
     required String context,
+    required String databaseEngine,
+    required int requestId,
   }) async {
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 20);
+    _activeHttpClient = client;
     try {
+      _throwIfCancelled(requestId);
       final request = await client.postUrl(Uri.parse(_endpoint));
       request.headers
         ..contentType = ContentType.json
@@ -141,6 +177,7 @@ class AiAssistantClient {
             settings: settings,
             conversation: conversation,
             context: context,
+            databaseEngine: databaseEngine,
           ),
         ),
       );
@@ -148,6 +185,7 @@ class AiAssistantClient {
       final response = await request.close().timeout(
         const Duration(minutes: 2),
       );
+      _throwIfCancelled(requestId);
       final body = await utf8.decoder.bind(response).join();
       final decoded = jsonDecode(body);
       if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -177,10 +215,13 @@ class AiAssistantClient {
     } on AiAssistantException {
       rethrow;
     } on SocketException catch (error) {
+      _throwIfCancelled(requestId);
       throw AiAssistantException('Network error: ${error.message}');
     } on TimeoutException {
+      _throwIfCancelled(requestId);
       throw const AiAssistantException('OpenAI request timed out.');
     } catch (error) {
+      _throwIfCancelled(requestId);
       throw AiAssistantException('AI request failed: $error');
     } finally {
       client.close(force: true);
@@ -191,10 +232,13 @@ class AiAssistantClient {
     required AiAssistantSettings settings,
     required List<AiAssistantMessage> conversation,
     required String context,
+    required String databaseEngine,
+    required int requestId,
   }) async {
     final prompt = buildCopilotPrompt(
       conversation: conversation,
       context: context,
+      databaseEngine: databaseEngine,
     );
     Process? process;
     try {
@@ -216,6 +260,8 @@ class AiAssistantClient {
         environment: processEnvironment,
         runInShell: Platform.isWindows && copilotExecutable == 'copilot',
       );
+      _activeProcess = process;
+      _throwIfCancelled(requestId);
       process.stdin.write(prompt);
       await process.stdin.close();
       final outputFuture = utf8.decoder.bind(process.stdout).join();
@@ -227,6 +273,7 @@ class AiAssistantClient {
           throw const AiAssistantException('GitHub Copilot request timed out.');
         },
       );
+      _throwIfCancelled(requestId);
       final output = (await outputFuture).trim();
       final error = (await errorFuture).trim();
       if (exitCode != 0) {
@@ -243,11 +290,13 @@ class AiAssistantClient {
     } on AiAssistantException {
       rethrow;
     } on ProcessException {
+      _throwIfCancelled(requestId);
       throw const AiAssistantException(
         'GitHub Copilot CLI was not found. Install it, verify `copilot '
         '--version` works, and then retry.',
       );
     } catch (error) {
+      _throwIfCancelled(requestId);
       throw AiAssistantException('GitHub Copilot request failed: $error');
     } finally {
       process?.kill();
@@ -362,10 +411,12 @@ class AiAssistantClient {
   static String buildCopilotPrompt({
     required List<AiAssistantMessage> conversation,
     required String context,
+    String databaseEngine = 'SQL',
   }) {
     final buffer = StringBuffer()
       ..writeln(
-        'You are a PostgreSQL assistant inside a database workbench. '
+        'You are a $databaseEngine database assistant inside a database '
+        'workbench. Generate SQL for $databaseEngine syntax and capabilities. '
         'Use only explicitly attached metadata and SQL. Never assume missing '
         'columns. Do not execute commands or access files. Prefer safe '
         'read-only SQL. Put generated SQL in fenced ```sql blocks.',
@@ -447,13 +498,15 @@ class AiAssistantClient {
     required AiAssistantSettings settings,
     required List<AiAssistantMessage> conversation,
     required String context,
+    String databaseEngine = 'SQL',
   }) {
     return {
       'model': settings.model,
       'store': false,
       'max_output_tokens': 2400,
       'instructions':
-          'You are a PostgreSQL assistant inside a database workbench. '
+          'You are a $databaseEngine database assistant inside a database '
+          'workbench. Generate SQL for $databaseEngine syntax and capabilities. '
           'Use only the explicitly attached metadata and SQL. Never assume '
           'columns that are not provided. Do not claim to execute queries. '
           'Prefer safe read-only SQL. Clearly warn before suggesting writes '
@@ -485,6 +538,12 @@ class AiAssistantClient {
     };
   }
 
+  void _throwIfCancelled(int requestId) {
+    if (_cancelledRequests.contains(requestId)) {
+      throw const AiRequestCancelledException();
+    }
+  }
+
   static String extractOutputText(Map<String, dynamic> response) {
     final parts = <String>[];
     final output = response['output'];
@@ -502,6 +561,10 @@ class AiAssistantClient {
     }
     return parts.join('\n\n');
   }
+}
+
+class AiRequestCancelledException extends AiAssistantException {
+  const AiRequestCancelledException() : super('AI request cancelled.');
 }
 
 class AiAssistantException implements Exception {

@@ -28,11 +28,59 @@ bool IsModifierKey(WPARAM key) {
   }
 }
 
+UINT NormalizeVirtualKey(WPARAM key, LPARAM flags) {
+  const UINT scan_code = (static_cast<UINT>(flags) >> 16) & 0xFF;
+  const bool extended = (static_cast<UINT>(flags) & (1U << 24)) != 0;
+
+  switch (key) {
+    case VK_SHIFT:
+    case VK_LSHIFT:
+    case VK_RSHIFT: {
+      const UINT mapped =
+          MapVirtualKey(scan_code, MAPVK_VSC_TO_VK_EX);
+      return mapped == VK_RSHIFT ? VK_RSHIFT : VK_LSHIFT;
+    }
+    case VK_CONTROL:
+    case VK_LCONTROL:
+    case VK_RCONTROL:
+      return extended ? VK_RCONTROL : VK_LCONTROL;
+    case VK_MENU:
+    case VK_LMENU:
+    case VK_RMENU:
+      return extended ? VK_RMENU : VK_LMENU;
+    default:
+      return static_cast<UINT>(key);
+  }
+}
+
+bool IsModifierStateDown(WPARAM key, LPARAM flags) {
+  const UINT normalized_key = NormalizeVirtualKey(key, flags);
+  if ((GetKeyState(normalized_key) & 0x8000) != 0) {
+    return true;
+  }
+
+  // Windows sometimes updates only the generic modifier state for the current
+  // message. Check it as a fallback before treating the event as stale.
+  switch (normalized_key) {
+    case VK_LMENU:
+    case VK_RMENU:
+      return (GetKeyState(VK_MENU) & 0x8000) != 0;
+    case VK_LCONTROL:
+    case VK_RCONTROL:
+      return (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    case VK_LSHIFT:
+    case VK_RSHIFT:
+      return (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    default:
+      return true;
+  }
+}
+
 UINT PhysicalKeyId(WPARAM key, LPARAM flags) {
   const UINT scan_code = (static_cast<UINT>(flags) >> 16) & 0xFF;
   const UINT extended = (static_cast<UINT>(flags) >> 24) & 0x01;
   return (scan_code << 1) | extended |
-         (static_cast<UINT>(key) << 16);
+         (NormalizeVirtualKey(key, flags) << 16);
 }
 
 bool IsRepeatedModifierKeyDown(UINT message, WPARAM key, LPARAM flags) {
@@ -117,10 +165,6 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
-  if (message == WM_ACTIVATEAPP && !wparam) {
-    ResetPhysicalKeyState();
-  }
-
   // Windows may emit auto-repeat messages for a held modifier. Some Flutter
   // engine versions classify those as another KeyDownEvent instead of a
   // KeyRepeatEvent, which violates HardwareKeyboard's state invariant.
@@ -162,27 +206,28 @@ LRESULT CALLBACK FlutterWindow::FlutterViewWindowProc(
 LRESULT FlutterWindow::HandleFlutterViewMessage(
     HWND window, UINT const message, WPARAM const wparam,
     LPARAM const lparam) noexcept {
-  if (message == WM_KILLFOCUS || message == WM_CANCELMODE) {
-    ResetPhysicalKeyState();
-  } else if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+  if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+    // A delayed Alt/Ctrl/Shift message can arrive after focus changes with no
+    // corresponding Windows modifier state. Forwarding it gives Flutter a
+    // RawKeyDownEvent with modifiers == 0, which violates RawKeyboard's state
+    // invariant.
+    if (IsModifierKey(wparam) && !IsModifierStateDown(wparam, lparam)) {
+      return 0;
+    }
+
     const UINT key_id = PhysicalKeyId(wparam, lparam);
     if (!pressed_physical_keys_.insert(key_id).second) {
-      if (IsModifierKey(wparam)) {
+      const bool is_repeat = (lparam & (1LL << 30)) != 0;
+      if (IsModifierKey(wparam) || !is_repeat) {
         return 0;
       }
-
-      // Some Windows/Flutter combinations report an auto-repeat as another
-      // KeyDownEvent. Repair the sequence so HardwareKeyboard receives a
-      // regular up/down pair while held letters, arrows, and Backspace still
-      // repeat normally.
-      const UINT key_up_message =
-          message == WM_SYSKEYDOWN ? WM_SYSKEYUP : WM_KEYUP;
-      const LPARAM key_up_flags = lparam | (1LL << 30) | (1LL << 31);
-      CallWindowProc(original_flutter_view_proc_, window, key_up_message,
-                     wparam, key_up_flags);
     }
   } else if (message == WM_KEYUP || message == WM_SYSKEYUP) {
-    pressed_physical_keys_.erase(PhysicalKeyId(wparam, lparam));
+    const bool was_pressed =
+        pressed_physical_keys_.erase(PhysicalKeyId(wparam, lparam)) != 0;
+    if (IsModifierKey(wparam) && !was_pressed) {
+      return 0;
+    }
   }
 
   return CallWindowProc(original_flutter_view_proc_, window, message, wparam,

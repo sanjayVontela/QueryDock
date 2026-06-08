@@ -1,13 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:postgres/postgres.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../contracts/database_driver.dart';
 import '../models/database_schema.dart';
 
-class PostgresConnectionConfig {
+class PostgresConnectionConfig implements DatabaseProfile {
   final String name;
   final String host;
   final int port;
@@ -15,7 +17,17 @@ class PostgresConnectionConfig {
   final String username;
   final String password;
   final SslMode sslMode;
+  @override
   final bool writeProtected;
+  @override
+  final String folder;
+  @override
+  final List<String> tags;
+  final bool sshEnabled;
+  final String sshHost;
+  final int sshPort;
+  final String sshUsername;
+  final String sshPrivateKeyPath;
 
   const PostgresConnectionConfig({
     this.name = '',
@@ -26,11 +38,28 @@ class PostgresConnectionConfig {
     required this.password,
     required this.sslMode,
     this.writeProtected = false,
+    this.folder = '',
+    this.tags = const [],
+    this.sshEnabled = false,
+    this.sshHost = '',
+    this.sshPort = 22,
+    this.sshUsername = '',
+    this.sshPrivateKeyPath = '',
   });
 
   String get endpointName => '$username@$host:$port/$database';
 
+  @override
   String get displayName => name.trim().isEmpty ? endpointName : name.trim();
+
+  @override
+  DatabaseEngine get engine => DatabaseEngine.postgresql;
+
+  @override
+  String get id => endpointName;
+
+  @override
+  String get databaseName => database;
 
   PostgresConnectionConfig copyWith({
     String? name,
@@ -41,6 +70,13 @@ class PostgresConnectionConfig {
     String? password,
     SslMode? sslMode,
     bool? writeProtected,
+    String? folder,
+    List<String>? tags,
+    bool? sshEnabled,
+    String? sshHost,
+    int? sshPort,
+    String? sshUsername,
+    String? sshPrivateKeyPath,
   }) {
     return PostgresConnectionConfig(
       name: name ?? this.name,
@@ -51,6 +87,13 @@ class PostgresConnectionConfig {
       password: password ?? this.password,
       sslMode: sslMode ?? this.sslMode,
       writeProtected: writeProtected ?? this.writeProtected,
+      folder: folder ?? this.folder,
+      tags: tags ?? this.tags,
+      sshEnabled: sshEnabled ?? this.sshEnabled,
+      sshHost: sshHost ?? this.sshHost,
+      sshPort: sshPort ?? this.sshPort,
+      sshUsername: sshUsername ?? this.sshUsername,
+      sshPrivateKeyPath: sshPrivateKeyPath ?? this.sshPrivateKeyPath,
     );
   }
 
@@ -63,6 +106,13 @@ class PostgresConnectionConfig {
       'username': username,
       'sslMode': sslMode.name,
       'writeProtected': writeProtected,
+      'folder': folder,
+      'tags': tags,
+      'sshEnabled': sshEnabled,
+      'sshHost': sshHost,
+      'sshPort': sshPort,
+      'sshUsername': sshUsername,
+      'sshPrivateKeyPath': sshPrivateKeyPath,
     };
   }
 
@@ -77,6 +127,16 @@ class PostgresConnectionConfig {
     final name = json['name']?.toString() ?? '';
     final sslModeName = json['sslMode']?.toString() ?? SslMode.disable.name;
     final writeProtected = json['writeProtected'] == true;
+    final folder = json['folder']?.toString() ?? '';
+    final tags = (json['tags'] as List<dynamic>? ?? const [])
+        .map((tag) => tag.toString())
+        .where((tag) => tag.isNotEmpty)
+        .toList();
+    final sshEnabled = json['sshEnabled'] == true;
+    final sshHost = json['sshHost']?.toString() ?? '';
+    final sshPort = int.tryParse(json['sshPort']?.toString() ?? '') ?? 22;
+    final sshUsername = json['sshUsername']?.toString() ?? '';
+    final sshPrivateKeyPath = json['sshPrivateKeyPath']?.toString() ?? '';
 
     if (host.isEmpty || port == null || database.isEmpty || username.isEmpty) {
       return null;
@@ -94,12 +154,20 @@ class PostgresConnectionConfig {
         orElse: () => SslMode.disable,
       ),
       writeProtected: writeProtected,
+      folder: folder,
+      tags: tags,
+      sshEnabled: sshEnabled,
+      sshHost: sshHost,
+      sshPort: sshPort,
+      sshUsername: sshUsername,
+      sshPrivateKeyPath: sshPrivateKeyPath,
     );
   }
 }
 
 class PostgresConnectionStore {
   static const _storageKey = 'postgres.connection.profiles';
+  static const _profileLimit = 100;
   final ConnectionSecretStore _secretStore;
 
   PostgresConnectionStore({ConnectionSecretStore? secretStore})
@@ -138,7 +206,7 @@ class PostgresConnectionStore {
         if (profile.endpointName != config.endpointName) profile,
     ];
     await _secretStore.write(config.endpointName, config.password);
-    await _writeProfiles(preferences, profiles.take(10));
+    await _writeProfiles(preferences, profiles.take(_profileLimit));
   }
 
   Future<void> delete(PostgresConnectionConfig config) async {
@@ -225,6 +293,48 @@ class PostgresQueryResult {
   }) : rowCount = rowCount ?? rows.length;
 }
 
+class PostgresObjectSearchResult {
+  final String type;
+  final String schema;
+  final String name;
+  final String detail;
+
+  const PostgresObjectSearchResult({
+    required this.type,
+    required this.schema,
+    required this.name,
+    required this.detail,
+  });
+}
+
+class PostgresSessionInfo {
+  final int pid;
+  final String database;
+  final String username;
+  final String application;
+  final String client;
+  final String state;
+  final String waitEvent;
+  final DateTime? queryStarted;
+  final String query;
+  final int lockCount;
+  final List<int> blockingPids;
+
+  const PostgresSessionInfo({
+    required this.pid,
+    required this.database,
+    required this.username,
+    required this.application,
+    required this.client,
+    required this.state,
+    required this.waitEvent,
+    required this.queryStarted,
+    required this.query,
+    required this.lockCount,
+    required this.blockingPids,
+  });
+}
+
 class PostgresQueryException implements Exception {
   final ServerException cause;
   final int? position;
@@ -283,35 +393,140 @@ ORDER BY c.relname;
 
   final PostgresConnectionConfig config;
   final Pool<void> _pool;
+  final Process? _sshTunnel;
+  final Endpoint _connectionEndpoint;
+  final ConnectionSettings _connectionSettings;
+  Connection? _transactionConnection;
+  bool _autoCommit = true;
+  bool _transactionActive = false;
   int? _activeBackendPid;
   bool _queryRunning = false;
   final List<DatabaseSchema> _schemaCache = [];
   final Map<String, List<DatabaseTable>> _tableCache = {};
   final Map<String, DatabaseTable> _tableDetailCache = {};
 
-  PostgresDatabase._({required this.config, required Pool<void> pool})
-    : _pool = pool;
+  PostgresDatabase._({
+    required this.config,
+    required Pool<void> pool,
+    required Endpoint connectionEndpoint,
+    required ConnectionSettings connectionSettings,
+    Process? sshTunnel,
+  }) : _pool = pool,
+       _connectionEndpoint = connectionEndpoint,
+       _connectionSettings = connectionSettings,
+       _sshTunnel = sshTunnel;
 
   static Future<PostgresDatabase> connect(
     PostgresConnectionConfig config,
   ) async {
-    final pool = Pool<void>.withEndpoints(
-      [_endpoint(config)],
-      settings: PoolSettings(
-        maxConnectionCount: 4,
-        maxConnectionAge: const Duration(minutes: 30),
-        maxSessionUse: const Duration(minutes: 10),
-        maxQueryCount: 1000,
+    Process? sshTunnel;
+    Pool<void>? pool;
+    var endpoint = _endpoint(config);
+    try {
+      if (config.sshEnabled) {
+        final tunnel = await _openSshTunnel(config);
+        sshTunnel = tunnel.process;
+        endpoint = Endpoint(
+          host: '127.0.0.1',
+          port: tunnel.localPort,
+          database: config.database,
+          username: config.username,
+          password: config.password.isEmpty ? null : config.password,
+        );
+      }
+      final connectionSettings = ConnectionSettings(
         applicationName: 'QueryDock',
         connectTimeout: const Duration(seconds: 10),
         queryTimeout: const Duration(minutes: 5),
         sslMode: config.sslMode,
-      ),
+      );
+      pool = Pool<void>.withEndpoints(
+        [endpoint],
+        settings: PoolSettings(
+          maxConnectionCount: 4,
+          maxConnectionAge: const Duration(minutes: 30),
+          maxSessionUse: const Duration(minutes: 10),
+          maxQueryCount: 1000,
+          applicationName: 'QueryDock',
+          connectTimeout: const Duration(seconds: 10),
+          queryTimeout: const Duration(minutes: 5),
+          sslMode: config.sslMode,
+        ),
+      );
+      await pool.withConnection(
+        (connection) => connection.execute('SELECT 1;', ignoreRows: true),
+      );
+      return PostgresDatabase._(
+        config: config,
+        pool: pool,
+        connectionEndpoint: endpoint,
+        connectionSettings: connectionSettings,
+        sshTunnel: sshTunnel,
+      );
+    } catch (_) {
+      await pool?.close();
+      sshTunnel?.kill();
+      rethrow;
+    }
+  }
+
+  bool get autoCommit => _autoCommit;
+  bool get transactionActive => _transactionActive;
+
+  static Future<({Process process, int localPort})> _openSshTunnel(
+    PostgresConnectionConfig config,
+  ) async {
+    if (config.sshHost.trim().isEmpty || config.sshUsername.trim().isEmpty) {
+      throw const FormatException(
+        'SSH host and username are required when SSH tunneling is enabled.',
+      );
+    }
+    final socket = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    final localPort = socket.port;
+    await socket.close();
+    final arguments = <String>[
+      '-N',
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ExitOnForwardFailure=yes',
+      '-o',
+      'ServerAliveInterval=30',
+      '-o',
+      'ServerAliveCountMax=3',
+      '-p',
+      '${config.sshPort}',
+      if (config.sshPrivateKeyPath.trim().isNotEmpty) ...[
+        '-i',
+        config.sshPrivateKeyPath.trim(),
+      ],
+      '-L',
+      '$localPort:${config.host}:${config.port}',
+      '${config.sshUsername}@${config.sshHost}',
+    ];
+    final process = await Process.start(
+      'ssh',
+      arguments,
+      runInShell: Platform.isWindows,
     );
-    await pool.withConnection(
-      (connection) => connection.execute('SELECT 1;', ignoreRows: true),
-    );
-    return PostgresDatabase._(config: config, pool: pool);
+    final errorBuffer = StringBuffer();
+    final errorSubscription = process.stderr
+        .transform(utf8.decoder)
+        .listen(errorBuffer.write);
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    final exitCode = await Future.any<int?>([
+      process.exitCode,
+      Future<int?>.delayed(const Duration(milliseconds: 1), () => null),
+    ]);
+    if (exitCode != null) {
+      await errorSubscription.cancel();
+      throw StateError(
+        'SSH tunnel failed (${exitCode == 255 ? 'authentication or connection error' : 'exit $exitCode'}): '
+        '${errorBuffer.toString().trim()}',
+      );
+    }
+    unawaited(process.exitCode.whenComplete(errorSubscription.cancel));
+    return (process: process, localPort: localPort);
   }
 
   static Endpoint _endpoint(PostgresConnectionConfig config) {
@@ -750,7 +965,7 @@ ORDER BY sort_order, name;
     final effectiveSql = _limitReadQuery(sql, maxRows);
     _queryRunning = true;
     try {
-      return await _pool.withConnection((connection) async {
+      return await _withExecutionConnection((connection) async {
         final pidResult = await connection.execute('SELECT pg_backend_pid();');
         _activeBackendPid = pidResult.first[0] as int;
         final statement = await connection.prepare(effectiveSql.sql);
@@ -828,10 +1043,302 @@ ORDER BY sort_order, name;
     }
   }
 
+  Future<List<PostgresQueryResult>> executeStatements(
+    String sql, {
+    int maxRows = defaultMaxRows,
+  }) async {
+    final statements = splitSqlStatements(sql);
+    if (statements.isEmpty) return const [];
+    final results = <PostgresQueryResult>[];
+    for (final statement in statements) {
+      try {
+        results.add(await execute(statement.sql, maxRows: maxRows));
+      } on PostgresQueryException catch (error) {
+        throw PostgresQueryException(
+          cause: error.cause,
+          position: error.position == null
+              ? null
+              : statement.offset + error.position!,
+        );
+      }
+    }
+    return results;
+  }
+
+  static List<({String sql, int offset})> splitSqlStatements(String source) {
+    final statements = <({String sql, int offset})>[];
+    var start = 0;
+    var quote = '';
+    var dollarTag = '';
+    var lineComment = false;
+    var blockDepth = 0;
+
+    void addStatement(int end) {
+      final raw = source.substring(start, end);
+      final sql = raw.trim();
+      if (sql.isNotEmpty) {
+        statements.add((sql: sql, offset: start + raw.indexOf(sql)));
+      }
+    }
+
+    for (var index = 0; index < source.length; index++) {
+      final char = source[index];
+      final next = index + 1 < source.length ? source[index + 1] : '';
+      if (lineComment) {
+        if (char == '\n') lineComment = false;
+        continue;
+      }
+      if (blockDepth > 0) {
+        if (char == '/' && next == '*') {
+          blockDepth++;
+          index++;
+        } else if (char == '*' && next == '/') {
+          blockDepth--;
+          index++;
+        }
+        continue;
+      }
+      if (dollarTag.isNotEmpty) {
+        if (source.startsWith(dollarTag, index)) {
+          index += dollarTag.length - 1;
+          dollarTag = '';
+        }
+        continue;
+      }
+      if (quote.isNotEmpty) {
+        if (char == quote) {
+          if (next == quote) {
+            index++;
+          } else {
+            quote = '';
+          }
+        }
+        continue;
+      }
+      if (char == '-' && next == '-') {
+        lineComment = true;
+        index++;
+      } else if (char == '/' && next == '*') {
+        blockDepth = 1;
+        index++;
+      } else if (char == "'" || char == '"') {
+        quote = char;
+      } else if (char == r'$') {
+        final match = RegExp(
+          r'^\$[A-Za-z_0-9]*\$',
+        ).firstMatch(source.substring(index));
+        if (match != null) {
+          dollarTag = match.group(0)!;
+          index += dollarTag.length - 1;
+        }
+      } else if (char == ';') {
+        addStatement(index);
+        start = index + 1;
+      }
+    }
+    addStatement(source.length);
+    return statements;
+  }
+
+  Future<T> _withExecutionConnection<T>(
+    Future<T> Function(Session connection) action,
+  ) async {
+    if (_autoCommit) {
+      return _pool.withConnection(action);
+    }
+    final connection = await _ensureTransactionConnection();
+    if (!_transactionActive) {
+      await connection.execute('BEGIN;', ignoreRows: true);
+      _transactionActive = true;
+    }
+    return action(connection);
+  }
+
+  Future<Connection> _ensureTransactionConnection() async {
+    final existing = _transactionConnection;
+    if (existing != null && existing.isOpen) return existing;
+    final connection = await Connection.open(
+      _connectionEndpoint,
+      settings: _connectionSettings,
+    );
+    _transactionConnection = connection;
+    return connection;
+  }
+
+  Future<void> setAutoCommit(bool enabled) async {
+    if (_autoCommit == enabled) return;
+    if (enabled && _transactionActive) {
+      throw StateError(
+        'Commit or roll back the pending transaction before enabling auto-commit.',
+      );
+    }
+    _autoCommit = enabled;
+    if (enabled) {
+      await _transactionConnection?.close();
+      _transactionConnection = null;
+    }
+  }
+
+  Future<void> commit() async {
+    final connection = _transactionConnection;
+    if (!_transactionActive || connection == null) return;
+    await connection.execute('COMMIT;', ignoreRows: true);
+    _transactionActive = false;
+  }
+
+  Future<void> rollback() async {
+    final connection = _transactionConnection;
+    if (!_transactionActive || connection == null) return;
+    await connection.execute('ROLLBACK;', ignoreRows: true);
+    _transactionActive = false;
+  }
+
+  Future<List<PostgresObjectSearchResult>> searchObjects(String query) async {
+    final pattern = '%${query.trim()}%';
+    if (query.trim().isEmpty) return const [];
+    final result = await _pool.execute(
+      Sql.named('''
+SELECT object_type, schema_name, object_name, detail
+FROM (
+  SELECT CASE c.relkind
+           WHEN 'r' THEN 'Table'
+           WHEN 'p' THEN 'Partitioned table'
+           WHEN 'v' THEN 'View'
+           WHEN 'm' THEN 'Materialized view'
+           WHEN 'f' THEN 'Foreign table'
+           ELSE 'Relation'
+         END AS object_type,
+         n.nspname AS schema_name,
+         c.relname AS object_name,
+         COALESCE(obj_description(c.oid, 'pg_class'), '') AS detail
+  FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+  WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+    AND n.nspname NOT LIKE 'pg_%'
+    AND n.nspname <> 'information_schema'
+  UNION ALL
+  SELECT 'Column', n.nspname, c.relname || '.' || a.attname,
+         pg_catalog.format_type(a.atttypid, a.atttypmod)
+  FROM pg_catalog.pg_attribute a
+  JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+  WHERE a.attnum > 0 AND NOT a.attisdropped
+    AND n.nspname NOT LIKE 'pg_%'
+    AND n.nspname <> 'information_schema'
+  UNION ALL
+  SELECT 'Function', n.nspname, p.proname,
+         pg_get_function_identity_arguments(p.oid)
+  FROM pg_catalog.pg_proc p
+  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname NOT LIKE 'pg_%'
+    AND n.nspname <> 'information_schema'
+) objects
+WHERE object_name ILIKE @pattern OR detail ILIKE @pattern
+ORDER BY object_type, schema_name, object_name
+LIMIT 250;
+'''),
+      parameters: {'pattern': pattern},
+    );
+    return [
+      for (final row in result)
+        PostgresObjectSearchResult(
+          type: row[0]?.toString() ?? '',
+          schema: row[1]?.toString() ?? '',
+          name: row[2]?.toString() ?? '',
+          detail: row[3]?.toString() ?? '',
+        ),
+    ];
+  }
+
+  Future<List<PostgresSessionInfo>> loadSessions() async {
+    final result = await _pool.execute('''
+SELECT a.pid,
+       COALESCE(a.datname, ''),
+       COALESCE(a.usename, ''),
+       COALESCE(a.application_name, ''),
+       COALESCE(a.client_addr::text, 'local'),
+       COALESCE(a.state, ''),
+       COALESCE(a.wait_event_type || ': ' || a.wait_event, ''),
+       a.query_start,
+       COALESCE(NULLIF(a.query, '<insufficient privilege>'), ''),
+       count(l.*)::int,
+       pg_blocking_pids(a.pid)
+FROM pg_catalog.pg_stat_activity a
+LEFT JOIN pg_catalog.pg_locks l ON l.pid = a.pid
+WHERE a.datname = current_database()
+GROUP BY a.pid, a.datname, a.usename, a.application_name, a.client_addr,
+         a.state, a.wait_event_type, a.wait_event, a.query_start, a.query
+ORDER BY a.query_start DESC NULLS LAST, a.pid;
+''');
+    return [
+      for (final row in result)
+        PostgresSessionInfo(
+          pid: row[0] as int,
+          database: row[1]?.toString() ?? '',
+          username: row[2]?.toString() ?? '',
+          application: row[3]?.toString() ?? '',
+          client: row[4]?.toString() ?? '',
+          state: row[5]?.toString() ?? '',
+          waitEvent: row[6]?.toString() ?? '',
+          queryStarted: row[7] as DateTime?,
+          query: row[8]?.toString() ?? '',
+          lockCount: row[9] as int? ?? 0,
+          blockingPids: (row[10] as List<dynamic>? ?? const [])
+              .whereType<int>()
+              .toList(),
+        ),
+    ];
+  }
+
+  Future<bool> cancelSession(int pid) async {
+    final result = await _pool.execute(
+      Sql.named('SELECT pg_cancel_backend(@pid);'),
+      parameters: {'pid': pid},
+    );
+    return result.isNotEmpty && result.first[0] == true;
+  }
+
+  Future<int> importRows(
+    String schema,
+    String table,
+    List<String> columns,
+    List<List<dynamic>> rows,
+  ) async {
+    if (columns.isEmpty || rows.isEmpty) return 0;
+    final columnSql = columns.map(_quoteIdentifier).join(', ');
+    var inserted = 0;
+    Future<void> insert(Session session) async {
+      for (final row in rows) {
+        final parameters = <String, Object?>{};
+        final placeholders = <String>[];
+        for (var index = 0; index < columns.length; index++) {
+          final name = 'value_$index';
+          parameters[name] = index < row.length ? row[index] : null;
+          placeholders.add('@$name');
+        }
+        final result = await session.execute(
+          Sql.named(
+            'INSERT INTO ${_quoteIdentifier(schema)}.${_quoteIdentifier(table)} '
+            '($columnSql) VALUES (${placeholders.join(', ')});',
+          ),
+          parameters: parameters,
+        );
+        inserted += result.affectedRows;
+      }
+    }
+
+    if (_autoCommit) {
+      await _pool.runTx(insert);
+    } else {
+      await _withExecutionConnection(insert);
+    }
+    return inserted;
+  }
+
   Future<int> updateRows(List<PostgresRowUpdate> updates) async {
     if (updates.isEmpty) return 0;
 
-    return _pool.runTx((session) async {
+    Future<int> update(Session session) async {
       var totalAffected = 0;
       for (final update in updates) {
         final parameters = <String, Object?>{};
@@ -882,7 +1389,12 @@ ORDER BY sort_order, name;
         totalAffected += result.affectedRows;
       }
       return totalAffected;
-    });
+    }
+
+    if (_autoCommit) {
+      return _pool.runTx(update);
+    }
+    return _withExecutionConnection(update);
   }
 
   Future<bool> cancelCurrentQuery() async {
@@ -896,7 +1408,12 @@ ORDER BY sort_order, name;
   }
 
   Future<void> close() async {
+    if (_transactionActive) {
+      await rollback();
+    }
+    await _transactionConnection?.close();
     await _pool.close();
+    _sshTunnel?.kill();
   }
 
   static String _columnName(String? name, int index) {
