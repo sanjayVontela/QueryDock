@@ -23,6 +23,10 @@ dependencies:
   flutter_secure_storage: ^10.3.1
   path_provider: ^2.1.5
   pluto_grid: ^8.1.0
+  file_selector: ^1.1.0
+  csv: ^6.0.0
+  sqlite3: ^3.3.2
+  mysql_client_plus: ^0.1.2
 
 
 dev_dependencies:

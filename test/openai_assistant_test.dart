@@ -65,6 +65,24 @@ void main() {
     expect(prompt, contains('Find duplicates'));
   });
 
+  test('AI prompts use the selected database engine', () {
+    final prompt = AiAssistantClient.buildCopilotPrompt(
+      databaseEngine: 'MySQL',
+      context: 'MySQL database: app',
+      conversation: const [],
+    );
+    final body = AiAssistantClient.buildRequestBody(
+      settings: const AiAssistantSettings(openAiApiKey: 'sk-test'),
+      databaseEngine: 'MySQL',
+      context: 'MySQL database: app',
+      conversation: const [],
+    );
+
+    expect(prompt, contains('MySQL database assistant'));
+    expect(prompt, isNot(contains('PostgreSQL assistant')));
+    expect(body['instructions'], contains('MySQL database assistant'));
+  });
+
   test('lets Copilot CLI choose an available model', () {
     final arguments = AiAssistantClient.copilotArguments();
 

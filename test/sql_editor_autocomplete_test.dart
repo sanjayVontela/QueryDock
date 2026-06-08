@@ -164,7 +164,11 @@ void main() {
     );
     expect(
       tester
-          .widget<Text>(find.text('Add a PostgreSQL connection to begin.'))
+          .widget<Text>(
+            find.text(
+              'Add a PostgreSQL, MySQL, or SQLite connection to begin.',
+            ),
+          )
           .style
           ?.color,
       scheme.onSurfaceVariant,
@@ -251,6 +255,78 @@ void main() {
     expect(find.text('Loading SQL scripts...'), findsNothing);
     expect(find.text('No editors open'), findsOneWidget);
     expect(find.byKey(const ValueKey('empty-editor-new-sql')), findsOneWidget);
+  });
+
+  testWidgets('Ctrl+W closes the active editor from editor focus', (
+    tester,
+  ) async {
+    await _pumpWorkbench(tester);
+    await tester.tap(find.byType(EditableText).first);
+    await tester.pump();
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.keyW);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.keyW);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await tester.pumpAndSettle();
+
+    expect(find.text('No editors open'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('messages can be cleared from the result panel', (tester) async {
+    await _pumpWorkbench(tester);
+
+    await tester.tap(find.text('Messages').first);
+    await tester.pump();
+    expect(find.textContaining('[INFO] QueryDock started'), findsWidgets);
+
+    await tester.tap(find.byTooltip('Clear messages').first);
+    await tester.pump();
+
+    expect(find.text('No messages.'), findsOneWidget);
+    expect(find.byTooltip('Clear messages'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('new connection can open the SQLite workbench', (tester) async {
+    await _pumpWorkbench(tester);
+
+    await tester.tap(find.text('New Connection').first);
+    await tester.pumpAndSettle();
+    expect(find.text('PostgreSQL'), findsOneWidget);
+    expect(find.text('SQLite'), findsOneWidget);
+
+    await tester.tap(find.text('SQLite'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('SQLite Workbench'), findsOneWidget);
+    expect(find.text('SQLite Navigator'), findsOneWidget);
+    expect(find.text('Open database'), findsOneWidget);
+    expect(find.text('Create database'), findsOneWidget);
+    expect(find.text('AI'), findsWidgets);
+    expect(find.text('Properties'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('MySQL uses the shared QueryDock workbench', (tester) async {
+    await _pumpWorkbench(tester);
+
+    await tester.tap(find.text('New Connection').first);
+    await tester.pumpAndSettle();
+    expect(find.text('MySQL'), findsOneWidget);
+
+    await tester.tap(find.text('MySQL'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('MySQL Connection'), findsOneWidget);
+    expect(find.text('Host'), findsOneWidget);
+    expect(find.text('Database'), findsWidgets);
+    expect(find.text('MySQL Workbench'), findsNothing);
+    expect(find.text('MySQL Connections'), findsNothing);
+    expect(find.text('AI'), findsWidgets);
+    expect(find.text('Database Navigator'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }
 

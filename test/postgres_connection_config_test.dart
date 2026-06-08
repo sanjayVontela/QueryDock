@@ -20,6 +20,13 @@ void main() {
       password: 'secret',
       sslMode: SslMode.require,
       writeProtected: true,
+      folder: 'Production',
+      tags: ['critical', 'read-mostly'],
+      sshEnabled: true,
+      sshHost: 'bastion.example.com',
+      sshPort: 2222,
+      sshUsername: 'deploy',
+      sshPrivateKeyPath: r'C:\keys\database_ed25519',
     );
 
     final restored = PostgresConnectionConfig.fromStoredJson(
@@ -33,6 +40,34 @@ void main() {
     expect(restored.password, isEmpty);
     expect(restored.sslMode, SslMode.require);
     expect(restored.writeProtected, isTrue);
+    expect(restored.folder, 'Production');
+    expect(restored.tags, ['critical', 'read-mostly']);
+    expect(restored.sshEnabled, isTrue);
+    expect(restored.sshHost, 'bastion.example.com');
+    expect(restored.sshPort, 2222);
+    expect(restored.sshUsername, 'deploy');
+    expect(restored.sshPrivateKeyPath, r'C:\keys\database_ed25519');
+  });
+
+  test('SQL splitter preserves quoted and procedural semicolons', () {
+    const sql = '''
+SELECT 'one;two';
+-- ignored ; separator
+DO \$body\$
+BEGIN
+  RAISE NOTICE 'still; one statement';
+END;
+\$body\$;
+SELECT "semi;colon" FROM example;
+''';
+
+    final statements = PostgresDatabase.splitSqlStatements(sql);
+
+    expect(statements, hasLength(3));
+    expect(statements[0].sql, "SELECT 'one;two'");
+    expect(statements[1].sql, contains('RAISE NOTICE'));
+    expect(statements[2].sql, 'SELECT "semi;colon" FROM example');
+    expect(statements[2].offset, sql.indexOf('SELECT "semi;colon"'));
   });
 
   test('connection store keeps password in secret storage', () async {

@@ -354,6 +354,11 @@ class DbToolbar extends StatelessWidget {
   final VoidCallback onToggleNavigator;
   final VoidCallback onToggleOutput;
   final VoidCallback onToggleAssistant;
+  final bool autoCommit;
+  final bool transactionActive;
+  final ValueChanged<bool> onAutoCommitChanged;
+  final VoidCallback onCommit;
+  final VoidCallback onRollback;
 
   const DbToolbar({
     super.key,
@@ -366,6 +371,11 @@ class DbToolbar extends StatelessWidget {
     required this.onToggleNavigator,
     required this.onToggleOutput,
     required this.onToggleAssistant,
+    required this.autoCommit,
+    required this.transactionActive,
+    required this.onAutoCommitChanged,
+    required this.onCommit,
+    required this.onRollback,
   });
 
   @override
@@ -404,6 +414,52 @@ class DbToolbar extends StatelessWidget {
             label: 'Stop',
             tooltip: 'Stop Query (Esc)',
             onTap: onStop,
+          ),
+          PopupMenuButton<String>(
+            tooltip: transactionActive
+                ? 'Transaction pending'
+                : autoCommit
+                ? 'Auto-commit enabled'
+                : 'Manual commit mode',
+            onSelected: (value) {
+              switch (value) {
+                case 'auto-commit':
+                  onAutoCommitChanged(!autoCommit);
+                case 'commit':
+                  onCommit();
+                case 'rollback':
+                  onRollback();
+              }
+            },
+            itemBuilder: (context) => [
+              CheckedPopupMenuItem(
+                value: 'auto-commit',
+                checked: autoCommit,
+                child: const Text('Auto-commit'),
+              ),
+              const PopupMenuDivider(),
+              PopupMenuItem(
+                value: 'commit',
+                enabled: transactionActive,
+                child: const Text('Commit'),
+              ),
+              PopupMenuItem(
+                value: 'rollback',
+                enabled: transactionActive,
+                child: const Text('Rollback'),
+              ),
+            ],
+            icon: Icon(
+              transactionActive
+                  ? Icons.warning_amber_rounded
+                  : autoCommit
+                  ? Icons.check_circle_outline
+                  : Icons.pending_actions_outlined,
+              size: 19,
+              color: transactionActive
+                  ? Theme.of(context).colorScheme.error
+                  : null,
+            ),
           ),
           const Spacer(),
           ToolbarButton(
@@ -452,9 +508,16 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
   late final TextEditingController _usernameController;
   late final TextEditingController _passwordController;
   late final TextEditingController _nameController;
+  late final TextEditingController _folderController;
+  late final TextEditingController _tagsController;
+  late final TextEditingController _sshHostController;
+  late final TextEditingController _sshPortController;
+  late final TextEditingController _sshUsernameController;
+  late final TextEditingController _sshKeyController;
 
   SslMode _sslMode = SslMode.disable;
   bool _writeProtected = false;
+  bool _sshEnabled = false;
   String? _errorText;
   bool _canConnect = false;
 
@@ -463,6 +526,24 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
     super.initState();
     final initialConfig = widget.initialConfig;
     _nameController = TextEditingController(text: initialConfig?.name ?? '');
+    _folderController = TextEditingController(
+      text: initialConfig?.folder ?? '',
+    );
+    _tagsController = TextEditingController(
+      text: initialConfig?.tags.join(', ') ?? '',
+    );
+    _sshHostController = TextEditingController(
+      text: initialConfig?.sshHost ?? '',
+    );
+    _sshPortController = TextEditingController(
+      text: (initialConfig?.sshPort ?? 22).toString(),
+    );
+    _sshUsernameController = TextEditingController(
+      text: initialConfig?.sshUsername ?? '',
+    );
+    _sshKeyController = TextEditingController(
+      text: initialConfig?.sshPrivateKeyPath ?? '',
+    );
     _hostController = TextEditingController(
       text: initialConfig?.host ?? 'localhost',
     );
@@ -480,6 +561,7 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
     );
     _sslMode = initialConfig?.sslMode ?? SslMode.disable;
     _writeProtected = initialConfig?.writeProtected ?? false;
+    _sshEnabled = initialConfig?.sshEnabled ?? false;
     for (final controller in [
       _hostController,
       _portController,
@@ -487,6 +569,12 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
       _usernameController,
       _passwordController,
       _nameController,
+      _folderController,
+      _tagsController,
+      _sshHostController,
+      _sshPortController,
+      _sshUsernameController,
+      _sshKeyController,
     ]) {
       controller.addListener(_validate);
     }
@@ -501,6 +589,12 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
     _databaseController.dispose();
     _usernameController.dispose();
     _passwordController.dispose();
+    _folderController.dispose();
+    _tagsController.dispose();
+    _sshHostController.dispose();
+    _sshPortController.dispose();
+    _sshUsernameController.dispose();
+    _sshKeyController.dispose();
     super.dispose();
   }
 
@@ -545,6 +639,13 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
                     _usernameController.text = connection.username;
                     _passwordController.text = connection.password;
                     _nameController.text = connection.name;
+                    _folderController.text = connection.folder;
+                    _tagsController.text = connection.tags.join(', ');
+                    _sshEnabled = connection.sshEnabled;
+                    _sshHostController.text = connection.sshHost;
+                    _sshPortController.text = connection.sshPort.toString();
+                    _sshUsernameController.text = connection.sshUsername;
+                    _sshKeyController.text = connection.sshPrivateKeyPath;
                     _sslMode = connection.sslMode;
                     setState(() {});
                     _validate();
@@ -556,6 +657,26 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
                 controller: _nameController,
                 label: 'Connection name',
                 icon: Icons.label_outline,
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: ConnectionTextField(
+                      controller: _folderController,
+                      label: 'Folder',
+                      icon: Icons.folder_outlined,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ConnectionTextField(
+                      controller: _tagsController,
+                      label: 'Tags (comma separated)',
+                      icon: Icons.sell_outlined,
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(height: 10),
               ConnectionTextField(
@@ -644,6 +765,64 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
                   style: TextStyle(fontSize: 12),
                 ),
               ),
+              ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                childrenPadding: EdgeInsets.zero,
+                title: const Text(
+                  'SSH tunnel',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+                leading: Switch(
+                  value: _sshEnabled,
+                  onChanged: (value) => setState(() => _sshEnabled = value),
+                ),
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ConnectionTextField(
+                          controller: _sshHostController,
+                          label: 'SSH host',
+                          icon: Icons.lan_outlined,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      SizedBox(
+                        width: 120,
+                        child: ConnectionTextField(
+                          controller: _sshPortController,
+                          label: 'SSH port',
+                          icon: Icons.tag,
+                          keyboardType: TextInputType.number,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  ConnectionTextField(
+                    controller: _sshUsernameController,
+                    label: 'SSH username',
+                    icon: Icons.person_outline,
+                  ),
+                  const SizedBox(height: 10),
+                  ConnectionTextField(
+                    controller: _sshKeyController,
+                    label: 'Private key path (optional when using SSH agent)',
+                    icon: Icons.key_outlined,
+                  ),
+                  const SizedBox(height: 6),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'Uses the system ssh command with key or SSH-agent authentication.',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
               if (_errorText != null) ...[
                 const SizedBox(height: 10),
                 Align(
@@ -680,6 +859,7 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
     final database = _databaseController.text.trim();
     final username = _usernameController.text.trim();
     final port = int.tryParse(_portController.text.trim());
+    final sshPort = int.tryParse(_sshPortController.text.trim()) ?? 22;
 
     if (host.isEmpty || database.isEmpty || username.isEmpty || port == null) {
       setState(() {
@@ -699,6 +879,18 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
         name: _nameController.text.trim(),
         sslMode: _sslMode,
         writeProtected: _writeProtected,
+        folder: _folderController.text.trim(),
+        tags: _tagsController.text
+            .split(',')
+            .map((tag) => tag.trim())
+            .where((tag) => tag.isNotEmpty)
+            .toSet()
+            .toList(),
+        sshEnabled: _sshEnabled,
+        sshHost: _sshHostController.text.trim(),
+        sshPort: sshPort,
+        sshUsername: _sshUsernameController.text.trim(),
+        sshPrivateKeyPath: _sshKeyController.text.trim(),
       ),
     );
   }
@@ -708,11 +900,16 @@ class _PostgresConnectionDialogState extends State<PostgresConnectionDialog> {
     final database = _databaseController.text.trim();
     final username = _usernameController.text.trim();
     final port = int.tryParse(_portController.text.trim());
+    final sshPort = int.tryParse(_sshPortController.text.trim());
     final nextCanConnect =
         host.isNotEmpty &&
         database.isNotEmpty &&
         username.isNotEmpty &&
-        port != null;
+        port != null &&
+        (!_sshEnabled ||
+            (_sshHostController.text.trim().isNotEmpty &&
+                _sshUsernameController.text.trim().isNotEmpty &&
+                sshPort != null));
 
     if (_canConnect == nextCanConnect) {
       return;
@@ -2133,8 +2330,9 @@ class PropertyRow extends StatelessWidget {
 
 class BottomHeader extends StatelessWidget {
   final VoidCallback? onClose;
+  final VoidCallback? onClear;
 
-  const BottomHeader({super.key, this.onClose});
+  const BottomHeader({super.key, this.onClose, this.onClear});
 
   @override
   Widget build(BuildContext context) {
@@ -2149,6 +2347,17 @@ class BottomHeader extends StatelessWidget {
             style: TextStyle(color: Colors.white70, fontSize: 13),
           ),
           const Spacer(),
+          if (onClear != null)
+            IconButton(
+              tooltip: 'Clear messages',
+              onPressed: onClear,
+              icon: const Icon(
+                Icons.delete_sweep_outlined,
+                size: 16,
+                color: Colors.white70,
+              ),
+              padding: EdgeInsets.zero,
+            ),
           if (onClose != null)
             IconButton(
               onPressed: onClose,

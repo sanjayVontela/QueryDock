@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:csv/csv.dart';
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter_code_editor/flutter_code_editor.dart';
 import 'package:flutter_highlight/themes/atom-one-dark.dart';
 import 'package:flutter_highlight/themes/github.dart';
@@ -16,10 +19,22 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../services/theme_controller.dart';
 import '../ai/services/openai_assistant.dart';
+import '../database/contracts/database_driver.dart';
+import '../database/drivers/mysql_driver.dart';
+import '../database/drivers/postgres_driver.dart';
 import '../database/models/database_schema.dart';
+import '../database/models/workbench_connection.dart';
 import '../database/services/postgres_database.dart';
 import '../database/services/result_indexer.dart';
+import '../database/services/mysql_database.dart';
+import 'dialogs/mysql_connection_dialog.dart';
+import 'models/open_database_connection.dart';
+import 'sqlite_workbench_page.dart';
+import 'services/database_query_runner.dart';
+import 'services/sql_autocomplete.dart';
+import 'services/workbench_services.dart';
 import 'widgets/db_viewer_widgets.dart';
+import 'widgets/database_connection_tree_tile.dart';
 
 class MyHomePage extends StatefulWidget {
   final String title;
@@ -43,13 +58,24 @@ class _MyHomePageState extends State<MyHomePage> {
 
   late final IdeController _controller;
   final PostgresConnectionStore _connectionStore = PostgresConnectionStore();
+  final MySqlConnectionStore _mySqlConnectionStore =
+      const MySqlConnectionStore();
+  final PostgresDriver _postgresDriver = PostgresDriver();
+  final MySqlDriver _mySqlDriver = const MySqlDriver();
   final AiAssistantSettingsStore _aiSettingsStore =
       const AiAssistantSettingsStore();
   final AiAssistantClient _aiClient = AiAssistantClient();
   final TextEditingController _aiPromptController = TextEditingController();
   final ScrollController _centerTabsController = ScrollController();
+  final ScrollController _sqliteTabsController = ScrollController();
+  final SqlHistoryStore _historyStore = const SqlHistoryStore();
+  final DatabaseQueryRunner _queryRunner = const DatabaseQueryRunner();
+  final SqlAutocompleteEngine _autocompleteEngine =
+      const SqlAutocompleteEngine();
+  final TextEditingController _objectSearchController = TextEditingController();
 
   PostgresDatabase? _database;
+  _OpenMySqlConnection? _activeMySqlConnection;
   PostgresDatabase? _executingDatabase;
   bool _isExecuting = false;
   bool _cancelRequested = false;
@@ -57,6 +83,10 @@ class _MyHomePageState extends State<MyHomePage> {
   bool _isConnecting = false;
   bool _showAllSqlScripts = false;
   bool _aiSending = false;
+  bool _objectSearching = false;
+  bool _sessionsLoading = false;
+  bool _sqliteWorkbenchOpen = false;
+  bool _sqliteWorkbenchActive = false;
   ResultGridRenderer _resultGridRenderer = ResultGridRenderer.queryDock;
   double _resultPanelHeight = 260;
   String _rightPanelMode = 'properties';
@@ -82,8 +112,14 @@ class _MyHomePageState extends State<MyHomePage> {
   int _resultIndexGeneration = 0;
   String? _resultSortColumn;
   bool _resultSortAscending = true;
+  List<DatabaseQueryResult> _statementResults = [];
+  int _activeStatementResult = 0;
+  List<SqlHistoryEntry> _sqlHistory = [];
+  List<PostgresObjectSearchResult> _objectSearchResults = [];
+  List<DatabaseSessionInfo> _sessions = [];
 
   final List<_OpenConnection> _connections = [];
+  final List<_OpenMySqlConnection> _mySqlConnections = [];
   final List<_SqlScriptTab> _sqlTabs = [];
   final List<_OpenTableTab> _openTableTabs = [];
   final Set<String> _loadingSchemas = {};
@@ -109,8 +145,10 @@ class _MyHomePageState extends State<MyHomePage> {
     _logs = ['[INFO] QueryDock started', '[INFO] No database connected'];
     _initializeSqlEditor();
     _loadSavedConnections();
+    _loadSavedMySqlConnections();
     _loadAiSettings();
     _loadResultGridRenderer();
+    _loadSqlHistory();
   }
 
   @override
@@ -124,9 +162,14 @@ class _MyHomePageState extends State<MyHomePage> {
     for (final connection in _connections) {
       unawaited(connection.database?.close() ?? Future<void>.value());
     }
+    for (final connection in _mySqlConnections) {
+      unawaited(connection.database?.close() ?? Future<void>.value());
+    }
     _activeResultTab.dispose();
     _aiPromptController.dispose();
     _centerTabsController.dispose();
+    _sqliteTabsController.dispose();
+    _objectSearchController.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -149,10 +192,54 @@ class _MyHomePageState extends State<MyHomePage> {
     });
   }
 
+  Future<void> _loadSavedMySqlConnections() async {
+    final profiles = await _mySqlConnectionStore.load();
+    if (!mounted) return;
+    setState(() {
+      _mySqlConnections
+        ..clear()
+        ..addAll([
+          for (final profile in profiles) _OpenMySqlConnection(config: profile),
+        ]);
+    });
+  }
+
   Future<void> _loadAiSettings() async {
     final settings = await _aiSettingsStore.load();
     if (!mounted) return;
     setState(() => _aiSettings = settings);
+  }
+
+  Future<void> _loadSqlHistory() async {
+    final history = await _historyStore.load();
+    if (!mounted) return;
+    setState(() => _sqlHistory = history);
+  }
+
+  Future<void> _recordSqlHistory({
+    required String sql,
+    required String connection,
+    required DateTime startedAt,
+    required int elapsedMilliseconds,
+    required int rowCount,
+    required bool succeeded,
+    String error = '',
+  }) async {
+    final entry = SqlHistoryEntry(
+      id: startedAt.microsecondsSinceEpoch.toString(),
+      sql: sql,
+      connection: connection,
+      startedAt: startedAt,
+      elapsedMilliseconds: elapsedMilliseconds,
+      rowCount: rowCount,
+      succeeded: succeeded,
+      error: error,
+    );
+    if (!mounted) return;
+    setState(() {
+      _sqlHistory = [entry, ..._sqlHistory].take(500).toList();
+    });
+    await _historyStore.save(_sqlHistory);
   }
 
   Future<void> _loadResultGridRenderer() async {
@@ -442,10 +529,22 @@ class _MyHomePageState extends State<MyHomePage> {
         settings: _aiSettings,
         conversation: conversation,
         context: _aiAttachments.map((item) => item.content).join('\n\n---\n\n'),
+        databaseEngine: _activeAiDatabaseEngine,
       );
       if (!mounted) return;
       setState(() {
         _aiMessages.add(AiAssistantMessage(role: 'assistant', text: response));
+        _aiSending = false;
+      });
+    } on AiRequestCancelledException {
+      if (!mounted) return;
+      setState(() {
+        _aiMessages.add(
+          const AiAssistantMessage(
+            role: 'assistant',
+            text: 'Request cancelled.',
+          ),
+        );
         _aiSending = false;
       });
     } catch (error) {
@@ -457,6 +556,23 @@ class _MyHomePageState extends State<MyHomePage> {
         _aiSending = false;
       });
     }
+  }
+
+  void _cancelAiRequest() {
+    if (!_aiSending) return;
+    _aiClient.cancel();
+  }
+
+  String get _activeAiDatabaseEngine {
+    final tab = _activeSqlTab;
+    if (tab != null) {
+      if (_mySqlConnectionForKey(tab.connectionKey) != null) return 'MySQL';
+      if (_connectionForKey(tab.connectionKey) != null) return 'PostgreSQL';
+    }
+    if (_activeMySqlConnection?.database != null) return 'MySQL';
+    if (_sqliteWorkbenchActive) return 'SQLite';
+    if (_database != null) return 'PostgreSQL';
+    return 'SQL';
   }
 
   String? _sqlFromAiMessage(String text) {
@@ -527,6 +643,7 @@ class _MyHomePageState extends State<MyHomePage> {
           ),
         ],
         context: _aiAttachments.map((item) => item.content).join('\n\n---\n\n'),
+        databaseEngine: _activeAiDatabaseEngine,
       );
       final suggestion = _sqlFromAiMessage(response) ?? response.trim();
       if (!mounted) return;
@@ -534,6 +651,9 @@ class _MyHomePageState extends State<MyHomePage> {
         tab.aiCompleting = false;
         tab.aiSuggestion = suggestion.isEmpty ? null : suggestion;
       });
+    } on AiRequestCancelledException {
+      if (!mounted) return;
+      setState(() => tab.aiCompleting = false);
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -559,6 +679,81 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _newConnection() async {
+    final engine = await showDialog<String>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('New Connection'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, 'postgresql'),
+            child: const ListTile(
+              leading: Icon(Icons.dns_outlined),
+              title: Text('PostgreSQL'),
+              subtitle: Text('Server connection'),
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, 'sqlite'),
+            child: const ListTile(
+              leading: Icon(Icons.storage_outlined),
+              title: Text('SQLite'),
+              subtitle: Text('Local database file'),
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, 'mysql'),
+            child: const ListTile(
+              leading: Icon(Icons.dns_outlined),
+              title: Text('MySQL'),
+              subtitle: Text('MySQL or MariaDB server'),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || engine == null) return;
+    if (engine == 'mysql') {
+      final config = await showDialog<MySqlConnectionConfig>(
+        context: context,
+        builder: (context) => const MySqlConnectionDialog(),
+      );
+      if (config == null) return;
+      await _mySqlConnectionStore.save(config);
+      if (!mounted) return;
+      setState(() {
+        final existing = _mySqlConnections.indexWhere(
+          (connection) => connection.config.endpointName == config.endpointName,
+        );
+        if (existing == -1) {
+          _mySqlConnections.insert(0, _OpenMySqlConnection(config: config));
+        } else {
+          _mySqlConnections[existing].config = config;
+          _mySqlConnections[existing].connectionError = null;
+        }
+        _activeConnection = config.displayName;
+        _activeSchema = '-';
+        _activeDriver = 'mysql';
+        _status = 'Disconnected';
+        _logs.add(
+          '[INFO] Saved MySQL profile: ${config.displayName}. Expand it to connect.',
+        );
+      });
+      _showResultTab('Messages');
+      return;
+    }
+    if (engine == 'sqlite') {
+      setState(() {
+        _sqliteWorkbenchOpen = true;
+        _sqliteWorkbenchActive = true;
+        _activeConnection = 'SQLite';
+        _activeSchema = 'main';
+        _activeDriver = 'sqlite3';
+        _status = 'Ready';
+      });
+      _revealLastCenterTab();
+      return;
+    }
+
     final savedConnections = await _connectionStore.load();
 
     if (!mounted) return;
@@ -634,7 +829,179 @@ class _MyHomePageState extends State<MyHomePage> {
     _showResultTab('Messages');
   }
 
+  Future<void> _editMySqlConnection(_OpenMySqlConnection connection) async {
+    final previous = connection.config;
+    final config = await showDialog<MySqlConnectionConfig>(
+      context: context,
+      builder: (context) => MySqlConnectionDialog(initial: previous),
+    );
+    if (config == null) return;
+    if (config.endpointName != previous.endpointName) {
+      await _mySqlConnectionStore.delete(previous);
+    }
+    await _mySqlConnectionStore.save(config);
+    await _invalidateMySqlConnection(connection, quiet: true);
+    if (!mounted) return;
+    setState(() {
+      for (final tab in _sqlTabs) {
+        if (tab.connectionKey == _mySqlConnectionKey(previous)) {
+          tab.connectionKey = _mySqlConnectionKey(config);
+        }
+      }
+      connection.config = config;
+      connection.connectionError = null;
+      _logs.add('[INFO] Updated MySQL profile: ${config.displayName}');
+    });
+  }
+
+  Future<void> _deleteMySqlConnection(_OpenMySqlConnection connection) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete MySQL Connection'),
+        content: Text('Delete ${connection.config.displayName}?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await _invalidateMySqlConnection(connection, quiet: true);
+    await _mySqlConnectionStore.delete(connection.config);
+    if (!mounted) return;
+    setState(() {
+      _mySqlConnections.remove(connection);
+      _logs.add(
+        '[INFO] Deleted MySQL profile: ${connection.config.displayName}',
+      );
+    });
+  }
+
+  Future<void> _invalidateMySqlConnection(
+    _OpenMySqlConnection connection, {
+    bool quiet = false,
+  }) async {
+    await connection.session?.close();
+    if (!mounted) return;
+    setState(() {
+      final removed = _openTableTabs.where(
+        (tab) =>
+            tab.profile.engine == DatabaseEngine.mysql &&
+            tab.profile.id == connection.config.id,
+      );
+      for (final tab in removed) {
+        tab.dispose();
+      }
+      _openTableTabs.removeWhere(
+        (tab) =>
+            tab.profile.engine == DatabaseEngine.mysql &&
+            tab.profile.id == connection.config.id,
+      );
+      connection.session = null;
+      connection.database = null;
+      connection.tables = const [];
+      connection.connectionError = null;
+      connection.isConnecting = false;
+      if (!quiet) {
+        _logs.add(
+          '[INFO] Invalidated MySQL connection: ${connection.config.displayName}',
+        );
+      }
+      final totalTabs = _sqlTabs.length + _openTableTabs.length;
+      if (totalTabs == 0) {
+        _activeCenterTab = 0;
+      } else if (_activeCenterTab >= totalTabs) {
+        _activeCenterTab = totalTabs - 1;
+      }
+    });
+  }
+
+  Future<bool> _ensureMySqlConnection(_OpenMySqlConnection connection) async {
+    if (connection.session != null) {
+      _activateMySqlConnection(connection);
+      return true;
+    }
+    if (connection.isConnecting) return false;
+    setState(() {
+      connection.isConnecting = true;
+      connection.connectionError = null;
+      _isConnecting = true;
+      _status = 'Connecting';
+      _activeConnection = connection.config.displayName;
+      _activeMySqlConnection = connection;
+    });
+    try {
+      final session =
+          await _mySqlDriver.connect(connection.config) as MySqlSession;
+      final database = session.database;
+      final tables = await session.loadTables(connection.config.database);
+      if (!mounted) {
+        await database.close();
+        return false;
+      }
+      setState(() {
+        connection.database = database;
+        connection.session = session;
+        connection.tables = tables;
+        connection.isConnecting = false;
+        _isConnecting =
+            _connections.any((item) => item.isConnecting) ||
+            _mySqlConnections.any((item) => item.isConnecting);
+        _activeConnection = connection.config.displayName;
+        _activeMySqlConnection = connection;
+        _activeSchema = connection.config.database;
+        _activeDriver = 'mysql ${connection.config.secure ? 'tls' : 'plain'}';
+        _status = 'Connected';
+        _logs.add('[INFO] Connected to MySQL ${connection.config.database}');
+      });
+      return true;
+    } catch (error) {
+      if (!mounted) return false;
+      setState(() {
+        connection.isConnecting = false;
+        connection.connectionError = error.toString();
+        _isConnecting =
+            _connections.any((item) => item.isConnecting) ||
+            _mySqlConnections.any((item) => item.isConnecting);
+        _status = 'Connection failed';
+        _logs.add('[ERROR] MySQL connection failed: $error');
+      });
+      _showResultTab('Messages');
+      return false;
+    }
+  }
+
+  void _activateMySqlConnection(_OpenMySqlConnection connection) {
+    setState(() {
+      _activeMySqlConnection = connection;
+      _sessions = const [];
+      _activeConnection = connection.config.displayName;
+      _activeSchema = connection.config.database;
+      _activeDriver = 'mysql ${connection.config.secure ? 'tls' : 'plain'}';
+      _status = connection.database == null ? 'Disconnected' : 'Connected';
+      _logs.add(
+        '[INFO] Activated MySQL connection: ${connection.config.displayName}',
+      );
+    });
+    if (_rightPanelMode == 'sessions') {
+      unawaited(_refreshSessions());
+    }
+  }
+
   Future<void> _deleteConnection(_OpenConnection connection) async {
+    final database = connection.database;
+    if (database != null && !await _confirmPendingTransaction(database)) {
+      return;
+    }
+    if (!mounted) return;
+
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -658,7 +1025,11 @@ class _MyHomePageState extends State<MyHomePage> {
     if (confirmed != true) return;
 
     await _connectionStore.delete(connection.config);
-    await _invalidateConnection(connection, quiet: true);
+    await _invalidateConnection(
+      connection,
+      quiet: true,
+      skipTransactionPrompt: true,
+    );
 
     if (!mounted) return;
 
@@ -681,6 +1052,7 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<void> _invalidateConnection(
     _OpenConnection connection, {
     bool quiet = false,
+    bool skipTransactionPrompt = false,
   }) async {
     final database = connection.database;
     if (database == null) {
@@ -696,6 +1068,9 @@ class _MyHomePageState extends State<MyHomePage> {
       return;
     }
 
+    if (!skipTransactionPrompt && !await _confirmPendingTransaction(database)) {
+      return;
+    }
     await database.close();
 
     if (!mounted) return;
@@ -707,7 +1082,8 @@ class _MyHomePageState extends State<MyHomePage> {
       connection.isConnecting = false;
       for (var index = _openTableTabs.length - 1; index >= 0; index--) {
         final tab = _openTableTabs[index];
-        if (tab.database == database) {
+        if (tab.session is PostgresSession &&
+            (tab.session as PostgresSession).database == database) {
           _openTableTabs.removeAt(index);
           tab.dispose();
         }
@@ -816,6 +1192,20 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Future<void> _executeSql() async {
     final tab = _activeSqlTab;
+    final mySqlConnection = tab == null
+        ? null
+        : _mySqlConnectionForKey(tab.connectionKey);
+    if (mySqlConnection != null) {
+      if (!await _ensureMySqlConnection(mySqlConnection)) return;
+      final execution = _sqlToExecute();
+      await _runMySql(
+        execution.sql,
+        mySqlConnection.session!,
+        editorText: tab?.controller.text,
+        editorOffset: execution.offset,
+      );
+      return;
+    }
     final database = tab == null ? _database : await _databaseForSqlTab(tab);
     if (tab != null &&
         tab.connectionKey != _globalScriptConnectionKey &&
@@ -832,6 +1222,103 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  Future<void> _runMySql(
+    String sql,
+    MySqlSession session, {
+    String? editorText,
+    int editorOffset = 0,
+  }) async {
+    if (sql.trim().isEmpty) return;
+    if (session.profile.writeProtected &&
+        _containsMutatingSql(sql) &&
+        !await _confirmProtectedWrite(session.profile)) {
+      setState(() {
+        _logs.add(
+          '[WARN] Update cancelled for protected connection: '
+          '${session.profile.displayName}',
+        );
+      });
+      _showResultTab('Messages');
+      return;
+    }
+    final startedAt = DateTime.now();
+    setState(() {
+      _isExecuting = true;
+      _cancelRequested = false;
+      _loadingOperation = 'Executing MySQL SQL...';
+      _activeSqlTab?.error = null;
+      _clearSqlResultState();
+      _logs.add('[INFO] Executing MySQL SQL...');
+    });
+    try {
+      final run = await _queryRunner.execute(session, sql);
+      final results = run.results;
+      final result = run.last;
+      if (!mounted) return;
+      setState(() {
+        _statementResults = results;
+        _activeStatementResult = results.length - 1;
+        _columns = result.columns;
+        _rows = result.rows;
+        _resultDatabase = null;
+        _resultSchema = null;
+        _resultTable = null;
+        _resultColumnMetadata = const [];
+        _resultPendingChanges.clear();
+        _resultColumnFilters.clear();
+        _resultSortColumn = null;
+        _resultIndexesReady = false;
+        _isExecuting = false;
+        _loadingOperation = null;
+        _logs.add(
+          '[INFO] MySQL query completed: ${result.rowCount} rows, '
+          '${result.affectedRows} affected',
+        );
+      });
+      await _refreshVisibleResultIndexes();
+      _showResultTab('Data');
+      unawaited(
+        _recordSqlHistory(
+          sql: sql,
+          connection: session.profile.displayName,
+          startedAt: startedAt,
+          elapsedMilliseconds: DateTime.now()
+              .difference(startedAt)
+              .inMilliseconds,
+          rowCount: results.fold(0, (total, item) => total + item.rowCount),
+          succeeded: true,
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isExecuting = false;
+        _loadingOperation = null;
+        _clearSqlResultState();
+        _activeSqlTab?.error = _SqlEditorError.fromPosition(
+          editorText ?? sql,
+          editorOffset + 1,
+          error.toString(),
+        );
+        _logs.add('[ERROR] MySQL query failed: $error');
+      });
+      unawaited(
+        _recordSqlHistory(
+          sql: sql,
+          connection: session.profile.displayName,
+          startedAt: startedAt,
+          elapsedMilliseconds: DateTime.now()
+              .difference(startedAt)
+              .inMilliseconds,
+          rowCount: 0,
+          succeeded: false,
+          error: error.toString(),
+        ),
+      );
+      _showResultTab('Messages');
+    }
+  }
+
   Future<PostgresQueryResult?> _runSql(
     String sql, {
     bool updateSqlResults = true,
@@ -841,6 +1328,7 @@ class _MyHomePageState extends State<MyHomePage> {
     String? loadingOperation,
   }) async {
     final database = databaseOverride ?? _database;
+    final startedAt = DateTime.now();
 
     if (database == null) {
       setState(() {
@@ -876,36 +1364,51 @@ class _MyHomePageState extends State<MyHomePage> {
       _cancelRequested = false;
       _loadingOperation = loadingOperation;
       _activeSqlTab?.error = null;
+      if (updateSqlResults) {
+        _clearSqlResultState();
+      }
       _logs.add('[INFO] Executing SQL...');
       _logs.add('[SQL] ${_sqlSummary(sql)}');
     });
 
     try {
       final streamedRows = <List<dynamic>>[];
-      final result = await database.execute(
-        sql,
-        onColumns: updateSqlResults
-            ? (columns) {
-                if (!mounted || !_isExecuting) return;
-                setState(() {
-                  _columns = columns;
-                  _rows = [];
-                  _visibleResultIndexes = [];
-                  _resultIndexesReady = false;
-                });
-              }
-            : null,
-        onRowsChunk: updateSqlResults
-            ? (rows) {
-                if (!mounted || !_isExecuting) return;
-                streamedRows.addAll(rows);
-                setState(() {
-                  _rows = streamedRows;
-                });
-                unawaited(_refreshVisibleResultIndexes());
-              }
-            : null,
-      );
+      final streamUiStopwatch = Stopwatch()..start();
+      final statements = PostgresDatabase.splitSqlStatements(sql);
+      late final List<PostgresQueryResult> statementResults;
+      if (updateSqlResults && statements.length > 1) {
+        statementResults = await database.executeStatements(sql);
+      } else {
+        statementResults = [
+          await database.execute(
+            sql,
+            onColumns: updateSqlResults
+                ? (columns) {
+                    if (!mounted || !_isExecuting) return;
+                    setState(() {
+                      _columns = columns;
+                      _rows = [];
+                      _visibleResultIndexes = [];
+                      _resultIndexesReady = false;
+                    });
+                  }
+                : null,
+            onRowsChunk: updateSqlResults
+                ? (rows) {
+                    if (!mounted || !_isExecuting) return;
+                    streamedRows.addAll(rows);
+                    if (streamUiStopwatch.elapsedMilliseconds >= 80) {
+                      streamUiStopwatch.reset();
+                      setState(() {
+                        _rows = List<List<dynamic>>.of(streamedRows);
+                      });
+                    }
+                  }
+                : null,
+          ),
+        ];
+      }
+      final result = statementResults.last;
 
       if (!_isExecuting) return null;
 
@@ -916,6 +1419,18 @@ class _MyHomePageState extends State<MyHomePage> {
 
       setState(() {
         if (updateSqlResults) {
+          _statementResults = [
+            for (final result in statementResults)
+              DatabaseQueryResult(
+                columns: result.columns,
+                rows: result.rows,
+                rowCount: result.rowCount,
+                affectedRows: result.affectedRows,
+                elapsed: result.elapsed,
+                rowLimitApplied: result.rowLimitApplied,
+              ),
+          ];
+          _activeStatementResult = statementResults.length - 1;
           _columns = result.columns;
           _rows = streamedRows.isEmpty ? result.rows : streamedRows;
           _resultDatabase = database;
@@ -946,6 +1461,21 @@ class _MyHomePageState extends State<MyHomePage> {
         await _refreshVisibleResultIndexes();
         _showResultTab('Data');
       }
+      unawaited(
+        _recordSqlHistory(
+          sql: sql,
+          connection: database.config.displayName,
+          startedAt: startedAt,
+          elapsedMilliseconds: DateTime.now()
+              .difference(startedAt)
+              .inMilliseconds,
+          rowCount: statementResults.fold(
+            0,
+            (total, item) => total + item.rowCount,
+          ),
+          succeeded: true,
+        ),
+      );
       return result;
     } catch (error) {
       if (!_isExecuting) return null;
@@ -956,6 +1486,9 @@ class _MyHomePageState extends State<MyHomePage> {
         final wasCancelled = _cancelRequested;
         _cancelRequested = false;
         _loadingOperation = null;
+        if (updateSqlResults) {
+          _clearSqlResultState();
+        }
         if (updateSqlResults && error is PostgresQueryException) {
           _activeSqlTab?.error = _SqlEditorError.fromPostgresException(
             editorText ?? sql,
@@ -975,8 +1508,169 @@ class _MyHomePageState extends State<MyHomePage> {
               : '[ERROR] Query failed: $error',
         );
       });
+      unawaited(
+        _recordSqlHistory(
+          sql: sql,
+          connection: database.config.displayName,
+          startedAt: startedAt,
+          elapsedMilliseconds: DateTime.now()
+              .difference(startedAt)
+              .inMilliseconds,
+          rowCount: 0,
+          succeeded: false,
+          error: error.toString(),
+        ),
+      );
       _showResultTab('Messages');
       return null;
+    }
+  }
+
+  void _clearSqlResultState() {
+    _statementResults = const [];
+    _activeStatementResult = 0;
+    _columns = const [];
+    _rows = const [];
+    _resultDatabase = null;
+    _resultSchema = null;
+    _resultTable = null;
+    _resultColumnMetadata = const [];
+    _resultColumnFilters.clear();
+    _resultPendingChanges.clear();
+    _visibleResultIndexes = const [];
+    _resultIndexesReady = true;
+    _resultSortColumn = null;
+    _resultSortAscending = true;
+  }
+
+  void _clearMessages() {
+    setState(() => _logs = []);
+  }
+
+  void _selectStatementResult(int index) {
+    if (index < 0 || index >= _statementResults.length) return;
+    final result = _statementResults[index];
+    setState(() {
+      _activeStatementResult = index;
+      _columns = result.columns;
+      _rows = result.rows;
+      _resultDatabase = null;
+      _resultSchema = null;
+      _resultTable = null;
+      _resultColumnMetadata = const [];
+      _resultPendingChanges.clear();
+      _resultColumnFilters.clear();
+      _resultSortColumn = null;
+      _resultIndexesReady = false;
+    });
+    unawaited(_refreshVisibleResultIndexes());
+  }
+
+  Future<void> _exportRows({
+    required String suggestedBaseName,
+    required List<String> columns,
+    required List<List<dynamic>> rows,
+    required String format,
+  }) async {
+    if (columns.isEmpty) return;
+    final isJson = format == 'json';
+    final location = await getSaveLocation(
+      suggestedName: '$suggestedBaseName.$format',
+      acceptedTypeGroups: [
+        XTypeGroup(label: isJson ? 'JSON' : 'CSV', extensions: [format]),
+      ],
+    );
+    if (location == null) return;
+    final content = isJson
+        ? const JsonEncoder.withIndent('  ').convert([
+            for (final row in rows)
+              {
+                for (final (index, column) in columns.indexed)
+                  column: index < row.length ? row[index] : null,
+              },
+          ])
+        : const ListToCsvConverter().convert([columns, ...rows]);
+    await XFile.fromData(
+      utf8.encode(content),
+      name: '$suggestedBaseName.$format',
+      mimeType: isJson ? 'application/json' : 'text/csv',
+    ).saveTo(location.path);
+    if (!mounted) return;
+    setState(() => _logs.add('[INFO] Exported ${rows.length} rows'));
+  }
+
+  Future<void> _exportSqlResult(String format) {
+    final visibleRows = _visibleSqlResultRows;
+    return _exportRows(
+      suggestedBaseName: 'querydock-result',
+      columns: _columns,
+      rows: [for (final item in visibleRows) item.row],
+      format: format,
+    );
+  }
+
+  Future<void> _exportTableData(_OpenTableTab tab, String format) {
+    return _exportRows(
+      suggestedBaseName: '${tab.schema}-${tab.table}',
+      columns: tab.resultColumns,
+      rows: tab.rows,
+      format: format,
+    );
+  }
+
+  Future<void> _importCsvIntoTable(_OpenTableTab tab) async {
+    if (tab.profile.writeProtected &&
+        !await _confirmProtectedWrite(tab.profile)) {
+      return;
+    }
+    final file = await openFile(
+      acceptedTypeGroups: const [
+        XTypeGroup(label: 'CSV', extensions: ['csv']),
+      ],
+    );
+    if (file == null) return;
+    final records = const CsvToListConverter(
+      shouldParseNumbers: false,
+    ).convert(await file.readAsString());
+    if (records.length < 2) return;
+    final columns = records.first.map((value) => value.toString()).toList();
+    final availableColumns = tab.columns.map((column) => column.name).toSet();
+    if (columns.any((column) => !availableColumns.contains(column))) {
+      if (!mounted) return;
+      setState(() {
+        _logs.add(
+          '[ERROR] CSV columns must match table columns: ${columns.join(', ')}',
+        );
+      });
+      _showResultTab('Messages');
+      return;
+    }
+    setState(() {
+      _isExecuting = true;
+      _loadingOperation = 'Importing CSV...';
+    });
+    try {
+      final inserted = await tab.session.importRows(
+        tab.schema,
+        tab.table,
+        columns,
+        [for (final record in records.skip(1)) List<dynamic>.of(record)],
+      );
+      if (!mounted) return;
+      setState(() {
+        _isExecuting = false;
+        _loadingOperation = null;
+        _logs.add('[INFO] Imported $inserted rows into ${tab.id}');
+      });
+      await _loadTableTabData(tab, reset: true);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isExecuting = false;
+        _loadingOperation = null;
+        _logs.add('[ERROR] CSV import failed: $error');
+      });
+      _showResultTab('Messages');
     }
   }
 
@@ -1071,7 +1765,7 @@ class _MyHomePageState extends State<MyHomePage> {
     ).hasMatch(sanitized);
   }
 
-  Future<bool> _confirmProtectedWrite(PostgresConnectionConfig config) async {
+  Future<bool> _confirmProtectedWrite(DatabaseProfile config) async {
     if (!mounted) return false;
 
     final confirmed = await showDialog<bool>(
@@ -1131,6 +1825,19 @@ class _MyHomePageState extends State<MyHomePage> {
     return null;
   }
 
+  String _mySqlConnectionKey(MySqlConnectionConfig config) {
+    return 'mysql:${config.endpointName}';
+  }
+
+  _OpenMySqlConnection? _mySqlConnectionForKey(String connectionKey) {
+    for (final connection in _mySqlConnections) {
+      if (connectionKey == _mySqlConnectionKey(connection.config)) {
+        return connection;
+      }
+    }
+    return null;
+  }
+
   Future<void> _setSqlTabConnection(
     _SqlScriptTab tab,
     String connectionKey,
@@ -1164,6 +1871,8 @@ class _MyHomePageState extends State<MyHomePage> {
     if (connectionKey == _globalScriptConnectionKey) {
       return 'No connection';
     }
+    final mySql = _mySqlConnectionForKey(connectionKey);
+    if (mySql != null) return '${mySql.config.displayName} (MySQL)';
     return _connectionForKey(connectionKey)?.config.displayName ??
         connectionKey;
   }
@@ -1177,6 +1886,81 @@ class _MyHomePageState extends State<MyHomePage> {
     }
 
     unawaited(_cancelRunningQuery());
+  }
+
+  Future<void> _setAutoCommit(bool enabled) async {
+    final database = _currentDatabase;
+    if (database == null) return;
+    try {
+      await database.setAutoCommit(enabled);
+      if (!mounted) return;
+      setState(() {
+        _logs.add(
+          '[INFO] ${enabled ? 'Enabled auto-commit' : 'Enabled manual commit mode'}',
+        );
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _logs.add('[WARN] $error'));
+      _showResultTab('Messages');
+    }
+  }
+
+  Future<void> _commitTransaction() async {
+    final database = _currentDatabase;
+    if (database == null) return;
+    await database.commit();
+    if (!mounted) return;
+    setState(() => _logs.add('[INFO] Transaction committed'));
+  }
+
+  Future<void> _rollbackTransaction() async {
+    final database = _currentDatabase;
+    if (database == null) return;
+    await database.rollback();
+    if (!mounted) return;
+    setState(() => _logs.add('[INFO] Transaction rolled back'));
+  }
+
+  Future<bool> _confirmPendingTransaction(PostgresDatabase? database) async {
+    if (database == null || !database.transactionActive || !mounted) {
+      return true;
+    }
+    final action = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        icon: const Icon(Icons.warning_amber_rounded),
+        title: const Text('Pending transaction'),
+        content: Text(
+          '${database.config.displayName} has uncommitted changes. '
+          'Commit or roll them back before disconnecting.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, 'cancel'),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, 'rollback'),
+            child: const Text('Rollback'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, 'commit'),
+            child: const Text('Commit'),
+          ),
+        ],
+      ),
+    );
+    if (action == 'commit') {
+      await database.commit();
+      return true;
+    }
+    if (action == 'rollback') {
+      await database.rollback();
+      return true;
+    }
+    return false;
   }
 
   Future<void> _cancelRunningQuery() async {
@@ -1232,6 +2016,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
     setState(() {
       _sqlTabs.add(script);
+      _sqliteWorkbenchActive = false;
       _activeCenterTab = _sqlTabs.length - 1;
       _logs.add('[INFO] Created SQL script: ${script.title}');
     });
@@ -1520,6 +2305,11 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _closeActiveCenterTab() {
+    if (_sqliteWorkbenchActive) {
+      _closeSqliteWorkbench();
+      return;
+    }
+
     final sqlTab = _activeSqlTab;
     if (sqlTab != null) {
       _closeSqlTab(sqlTab);
@@ -1529,7 +2319,55 @@ class _MyHomePageState extends State<MyHomePage> {
     final tableTab = _activeTableTab;
     if (tableTab != null) {
       _closeTableTab(tableTab);
+      return;
     }
+  }
+
+  void _closeSqliteWorkbench() {
+    setState(() {
+      _sqliteWorkbenchOpen = false;
+      _sqliteWorkbenchActive = false;
+      _activeConnection = _database?.config.displayName ?? 'No Connection';
+      _activeSchema = _database == null ? '-' : _activeSchema;
+      _activeDriver = _database == null
+          ? '-'
+          : 'postgres ${_database!.config.sslMode.name}';
+      _status = _database == null ? 'Disconnected' : 'Connected';
+    });
+  }
+
+  void _attachSqliteContext(String label, String content) {
+    _addAiAttachment(
+      _AiAttachment(
+        id: 'sqlite:$label',
+        label: label,
+        icon: Icons.storage_outlined,
+        content: content,
+      ),
+    );
+    setState(() {
+      _rightPanelMode = 'assistant';
+      if (!_controller.rootController.isVisible(IdePane.right.id)) {
+        _controller.rootController.show(IdePane.right.id);
+      }
+    });
+  }
+
+  void _attachMySqlContext(String label, String content) {
+    _addAiAttachment(
+      _AiAttachment(
+        id: 'mysql:$label',
+        label: label,
+        icon: Icons.dns_outlined,
+        content: content,
+      ),
+    );
+    setState(() {
+      _rightPanelMode = 'assistant';
+      if (!_controller.rootController.isVisible(IdePane.right.id)) {
+        _controller.rootController.show(IdePane.right.id);
+      }
+    });
   }
 
   void _openTable(String schema, String table) {
@@ -1815,8 +2653,11 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       if (existingIndex == -1) {
         tab = _OpenTableTab(
-          database: database,
-          connectionName: _activeConnection,
+          session: PostgresSession(
+            profile: database.config,
+            database: database,
+            driver: _postgresDriver,
+          ),
           schema: schema,
           metadata: loadedTable,
         );
@@ -1837,6 +2678,57 @@ class _MyHomePageState extends State<MyHomePage> {
     await _loadTableTabData(tab);
   }
 
+  Future<void> _openMySqlTableData(
+    _OpenMySqlConnection connection,
+    DatabaseTable table,
+  ) async {
+    if (!await _ensureMySqlConnection(connection)) return;
+    var metadata = table;
+    if (!metadata.columnsLoaded) {
+      metadata = await connection.database!.loadTable(table.name);
+      if (!mounted) return;
+      setState(() {
+        final index = connection.tables.indexWhere(
+          (item) => item.name == table.name,
+        );
+        if (index >= 0) connection.tables[index] = metadata;
+      });
+    }
+    final existingIndex = _openTableTabs.indexWhere(
+      (tab) =>
+          tab.profile.engine == DatabaseEngine.mysql &&
+          tab.profile.id == connection.config.id &&
+          tab.table == table.name,
+    );
+    late final _OpenTableTab tab;
+    setState(() {
+      _sqliteWorkbenchActive = false;
+      if (existingIndex == -1) {
+        tab = _OpenTableTab(
+          session: connection.session!,
+          schema: connection.config.database,
+          metadata: metadata,
+        );
+        _openTableTabs.add(tab);
+        _activeCenterTab = _tableTabOffset + _openTableTabs.length - 1;
+      } else {
+        tab = _openTableTabs[existingIndex];
+        _activeCenterTab = _tableTabOffset + existingIndex;
+      }
+      _activeMySqlConnection = connection;
+      _activeConnection = connection.config.displayName;
+      _activeSchema = connection.config.database;
+      _activeDriver = 'mysql ${connection.config.secure ? 'tls' : 'plain'}';
+      _status = 'Connected';
+      _logs.add(
+        '[INFO] Opened MySQL data browser: '
+        '${connection.config.database}.${table.name}',
+      );
+    });
+    if (existingIndex == -1) _revealLastCenterTab();
+    await _loadTableTabData(tab);
+  }
+
   Future<void> _applyTableFilter(_OpenTableTab tab) async {
     setState(() {
       _logs.add('[INFO] Applied table filter: ${tab.id}');
@@ -1849,12 +2741,16 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       final index = _openTableTabs.indexOf(tab);
       if (index == -1) return;
+      final removedIndex = _tableTabOffset + index;
       _openTableTabs.removeAt(index);
       tab.dispose();
-      if (_activeCenterTab >= _tableTabOffset + _openTableTabs.length) {
-        _activeCenterTab = _openTableTabs.isEmpty
+      if (_activeCenterTab == removedIndex) {
+        final totalTabs = _sqlTabs.length + _openTableTabs.length;
+        _activeCenterTab = totalTabs == 0
             ? 0
-            : _tableTabOffset + _openTableTabs.length - 1;
+            : removedIndex.clamp(0, totalTabs - 1);
+      } else if (_activeCenterTab > removedIndex) {
+        _activeCenterTab--;
       }
       _logs.add('[INFO] Closed table data browser: ${tab.id}');
     });
@@ -1929,8 +2825,8 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Future<void> _saveTableChanges(_OpenTableTab tab) async {
     if (!tab.canEdit || tab.pendingChanges.isEmpty) return;
-    if (tab.database.config.writeProtected &&
-        !await _confirmProtectedWrite(tab.database.config)) {
+    if (tab.profile.writeProtected &&
+        !await _confirmProtectedWrite(tab.profile)) {
       return;
     }
 
@@ -1940,7 +2836,7 @@ class _MyHomePageState extends State<MyHomePage> {
     });
 
     try {
-      final updates = <PostgresRowUpdate>[];
+      final updates = <DatabaseRowUpdate>[];
       for (final rowEntry in tab.pendingChanges.entries) {
         final originalRow = tab.rows[rowEntry.key];
         final changes = <String, Object?>{};
@@ -1955,7 +2851,7 @@ class _MyHomePageState extends State<MyHomePage> {
             column.name: originalRow[tab.resultColumns.indexOf(column.name)],
         };
         updates.add(
-          PostgresRowUpdate(
+          DatabaseRowUpdate(
             schema: tab.schema,
             table: tab.table,
             changes: changes,
@@ -1964,7 +2860,7 @@ class _MyHomePageState extends State<MyHomePage> {
           ),
         );
       }
-      final affectedRows = await tab.database.updateRows(updates);
+      final affectedRows = await tab.session.updateRows(updates);
 
       if (!mounted) return;
       setState(() {
@@ -2222,30 +3118,59 @@ class _MyHomePageState extends State<MyHomePage> {
     });
 
     final offset = reset ? 0 : tab.rows.length;
-    final result = await _runSql(
-      _buildTableDataSql(tab, offset: offset),
-      updateSqlResults: false,
-      databaseOverride: tab.database,
-      loadingOperation: reset ? 'Loading ${tab.schema}.${tab.table}...' : null,
-    );
-    if (result == null) {
-      if (mounted) setState(() => tab.loadingPage = false);
-      return;
+    if (reset) {
+      setState(() {
+        _isExecuting = true;
+        _loadingOperation = 'Loading ${tab.schema}.${tab.table}...';
+      });
     }
-    final fetchedRows = result.rows;
-    final hasMoreRows = fetchedRows.length > _OpenTableTab.pageSize;
-    final pageRows = fetchedRows.take(_OpenTableTab.pageSize).toList();
-    setState(() {
-      tab.resultColumns = result.columns;
-      if (reset) {
-        tab.rows = pageRows;
-        tab.pendingChanges.clear();
-      } else {
-        tab.rows.addAll(pageRows);
-      }
-      tab.hasMoreRows = hasMoreRows;
-      tab.loadingPage = false;
-    });
+    try {
+      final filters = [
+        if (tab.filterController.text.trim().isNotEmpty)
+          '(${tab.filterController.text.trim()})',
+        for (final entry in tab.columnFilters.entries)
+          _columnFilterSql(entry.key, entry.value, engine: tab.profile.engine),
+      ];
+      final orderBy =
+          tab.sortColumn ??
+          (tab.primaryKeyColumns.isEmpty
+              ? null
+              : tab.primaryKeyColumns.first.name);
+      final result = await tab.session.loadTableData(
+        tab.schema,
+        tab.table,
+        limit: _OpenTableTab.pageSize + 1,
+        offset: offset,
+        orderBy: orderBy,
+        ascending: tab.sortColumn == null || tab.sortAscending,
+        filters: filters,
+      );
+      if (!mounted) return;
+      final hasMoreRows = result.rows.length > _OpenTableTab.pageSize;
+      final pageRows = result.rows.take(_OpenTableTab.pageSize).toList();
+      setState(() {
+        tab.resultColumns = result.columns;
+        if (reset) {
+          tab.rows = pageRows;
+          tab.pendingChanges.clear();
+        } else {
+          tab.rows.addAll(pageRows);
+        }
+        tab.hasMoreRows = hasMoreRows;
+        tab.loadingPage = false;
+        _isExecuting = false;
+        _loadingOperation = null;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        tab.loadingPage = false;
+        _isExecuting = false;
+        _loadingOperation = null;
+        _logs.add('[ERROR] Table load failed: $error');
+      });
+      _showResultTab('Messages');
+    }
   }
 
   Future<void> _loadMoreTableRows(_OpenTableTab tab) {
@@ -2285,6 +3210,8 @@ class _MyHomePageState extends State<MyHomePage> {
     }
 
     setState(() {
+      _activeMySqlConnection = null;
+      _sessions = const [];
       _database = database;
       _activeConnection = database.config.displayName;
       _activeSchema = connection.schemas.isEmpty
@@ -2295,6 +3222,9 @@ class _MyHomePageState extends State<MyHomePage> {
       _filterSqlTabsForActiveConnection();
       _logs.add('[INFO] Activated connection: $_activeConnection');
     });
+    if (_rightPanelMode == 'sessions') {
+      unawaited(_refreshSessions());
+    }
   }
 
   void _filterSqlTabsForActiveConnection() {
@@ -2325,150 +3255,47 @@ class _MyHomePageState extends State<MyHomePage> {
     final cursor = value.selection.isValid
         ? value.selection.baseOffset
         : value.text.length;
-    final textBeforeCursor = value.text.substring(0, cursor);
-    final match = RegExp(
-      r'[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]*)?$',
-    ).firstMatch(textBeforeCursor);
-    final token = match?.group(0) ?? '';
-    if (token.isEmpty) return const [];
-
-    final lowerToken = token.toLowerCase();
-    final tokenStart = match?.start ?? cursor;
     final connection = _connectionForKey(tab.connectionKey);
-    final schemas =
-        connection?.schemas ??
-        _activeOpenConnection?.schemas ??
-        const <DatabaseSchema>[];
-    final aliases = _sqlAliases(value.text);
-
-    if (token.contains('.')) {
-      final dotIndex = token.indexOf('.');
-      final qualifier = token.substring(0, dotIndex);
-      final suffix = token.substring(dotIndex + 1).toLowerCase();
+    final associatedMySqlConnection = _mySqlConnectionForKey(tab.connectionKey);
+    final mySqlConnection =
+        associatedMySqlConnection ??
+        (tab.connectionKey == _globalScriptConnectionKey
+            ? _activeMySqlConnection
+            : null);
+    final schemas = mySqlConnection == null
+        ? connection?.schemas ??
+              _activeOpenConnection?.schemas ??
+              const <DatabaseSchema>[]
+        : [
+            DatabaseSchema(
+              name: mySqlConnection.config.database,
+              tables: mySqlConnection.tables,
+              tablesLoaded: true,
+            ),
+          ];
+    final result = _autocompleteEngine.build(
+      sql: value.text,
+      cursor: cursor,
+      schemas: schemas,
+    );
+    final request = result.metadataRequest;
+    if (request?.table != null) {
+      _loadAutocompleteTableColumns(
+        tab,
+        request!.schema,
+        request.table!,
+        connection: connection,
+        mySqlConnection: mySqlConnection,
+      );
+    } else if (request?.schema != null && connection != null) {
       final schema = schemas
-          .where(
-            (candidate) =>
-                candidate.name.toLowerCase() == qualifier.toLowerCase(),
-          )
+          .where((item) => item.name == request!.schema)
           .firstOrNull;
       if (schema != null) {
-        if (!schema.tablesLoaded && connection != null) {
-          _loadAutocompleteSchemaTables(connection, schema, tab);
-          return const [];
-        }
-        return [
-          for (final table in schema.tables)
-            if (table.name.toLowerCase().startsWith(suffix))
-              _SqlCompletion(
-                label: '${schema.name}.${table.name}',
-                detail: 'Table',
-                text: value.text.replaceRange(
-                  tokenStart,
-                  cursor,
-                  '${schema.name}.${table.name} ${_tableAlias(table.name, aliases.keys)}',
-                ),
-                cursorOffset:
-                    tokenStart +
-                    schema.name.length +
-                    table.name.length +
-                    _tableAlias(table.name, aliases.keys).length +
-                    2,
-                schema: schema.name,
-                table: table.name,
-              ),
-        ].take(12).toList();
-      }
-
-      final alias = qualifier;
-      final columnPrefix = suffix;
-      final tableReference = aliases[alias.toLowerCase()];
-      if (tableReference == null) return const [];
-
-      final table = _findTable(
-        schemas,
-        tableReference.schema,
-        tableReference.table,
-      );
-      if (table == null || !table.columnsLoaded) return const [];
-
-      return [
-        for (final column in table.columns)
-          if (column.name.toLowerCase().startsWith(columnPrefix))
-            _SqlCompletion(
-              label: '$alias.${column.name}',
-              detail: column.displayType,
-              text: value.text.replaceRange(
-                tokenStart,
-                cursor,
-                '$alias.${column.name}',
-              ),
-              cursorOffset: tokenStart + alias.length + column.name.length + 1,
-            ),
-      ].take(12).toList();
-    }
-
-    final completions = <_SqlCompletion>[];
-    final keywords = <String>{
-      'SELECT',
-      'FROM',
-      'WHERE',
-      'ORDER BY',
-      'GROUP BY',
-      'LIMIT',
-      'JOIN',
-      'LEFT JOIN',
-      'INNER JOIN',
-      'INSERT',
-      'UPDATE',
-      'DELETE',
-    };
-
-    for (final keyword in keywords) {
-      if (keyword.toLowerCase().startsWith(lowerToken)) {
-        completions.add(
-          _SqlCompletion(
-            label: keyword,
-            detail: 'SQL keyword',
-            text: value.text.replaceRange(tokenStart, cursor, keyword),
-            cursorOffset: tokenStart + keyword.length,
-          ),
-        );
+        _loadAutocompleteSchemaTables(connection, schema, tab);
       }
     }
-
-    for (final schema in schemas) {
-      if (schema.name.toLowerCase().startsWith(lowerToken)) {
-        completions.add(
-          _SqlCompletion(
-            label: schema.name,
-            detail: 'Schema',
-            text: value.text.replaceRange(tokenStart, cursor, schema.name),
-            cursorOffset: tokenStart + schema.name.length,
-          ),
-        );
-      }
-      for (final table in schema.tables) {
-        final qualifiedName = '${schema.name}.${table.name}';
-        if (!table.name.toLowerCase().startsWith(lowerToken) &&
-            !qualifiedName.toLowerCase().startsWith(lowerToken)) {
-          continue;
-        }
-        final alias = _tableAlias(table.name, aliases.keys);
-        final insertion = '${table.name} $alias';
-        completions.add(
-          _SqlCompletion(
-            label: table.name,
-            detail: 'Table  ->  $insertion',
-            text: value.text.replaceRange(tokenStart, cursor, insertion),
-            cursorOffset: tokenStart + insertion.length,
-            schema: schema.name,
-            table: table.name,
-          ),
-        );
-      }
-    }
-
-    return completions.take(12).toList();
+    return result.options;
   }
 
   void _loadAutocompleteSchemaTables(
@@ -2486,6 +3313,46 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  void _loadAutocompleteTableColumns(
+    _SqlScriptTab tab,
+    String? schema,
+    DatabaseTable table, {
+    _OpenConnection? connection,
+    _OpenMySqlConnection? mySqlConnection,
+  }) {
+    final engineKey = mySqlConnection?.config.id ?? connection?.config.id;
+    if (engineKey == null) return;
+    final key = '$engineKey.${schema ?? ''}.${table.name}';
+    if (!_autocompleteSchemaLoads.add(key)) return;
+
+    Future<void> load() async {
+      try {
+        if (mySqlConnection != null) {
+          final session = mySqlConnection.session;
+          if (session == null) return;
+          final loaded = await session.loadTable(
+            mySqlConnection.config.database,
+            table.name,
+          );
+          if (!mounted) return;
+          final index = mySqlConnection.tables.indexWhere(
+            (item) => item.name.toLowerCase() == loaded.name.toLowerCase(),
+          );
+          if (index >= 0) {
+            mySqlConnection.tables[index] = loaded;
+          }
+        } else if (connection != null && schema != null) {
+          await _loadTableColumnsForConnection(connection, schema, table);
+        }
+      } finally {
+        _autocompleteSchemaLoads.remove(key);
+        if (mounted) tab.controller.refreshCompletions();
+      }
+    }
+
+    unawaited(load());
+  }
+
   void _insertAutocompleteOption(_SqlCompletion option) {
     final sqlTab = _activeSqlTab;
     if (sqlTab == null) return;
@@ -2496,6 +3363,26 @@ class _MyHomePageState extends State<MyHomePage> {
     );
 
     if (option.schema != null && option.table != null) {
+      final mySqlConnection = _mySqlConnectionForKey(sqlTab.connectionKey);
+      final effectiveMySqlConnection =
+          mySqlConnection ??
+          (sqlTab.connectionKey == _globalScriptConnectionKey
+              ? _activeMySqlConnection
+              : null);
+      if (effectiveMySqlConnection != null) {
+        final table = effectiveMySqlConnection.tables
+            .where((item) => item.name == option.table)
+            .firstOrNull;
+        if (table != null && !table.columnsLoaded) {
+          _loadAutocompleteTableColumns(
+            sqlTab,
+            option.schema,
+            table,
+            mySqlConnection: effectiveMySqlConnection,
+          );
+        }
+        return;
+      }
       final connection =
           _connectionForKey(sqlTab.connectionKey) ?? _activeOpenConnection;
       final table = connection?.schemas
@@ -2509,72 +3396,6 @@ class _MyHomePageState extends State<MyHomePage> {
         );
       }
     }
-  }
-
-  Map<String, _SqlTableReference> _sqlAliases(String sql) {
-    final aliases = <String, _SqlTableReference>{};
-    final pattern = RegExp(
-      r'\b(?:from|join)\s+(?:(\w+)\.)?(\w+)\s+(?:as\s+)?(\w+)',
-      caseSensitive: false,
-    );
-    const reserved = {
-      'where',
-      'join',
-      'left',
-      'right',
-      'inner',
-      'outer',
-      'full',
-      'cross',
-      'order',
-      'group',
-      'limit',
-      'on',
-      'union',
-    };
-
-    for (final match in pattern.allMatches(sql)) {
-      final alias = match.group(3)?.toLowerCase();
-      if (alias == null || reserved.contains(alias)) continue;
-      aliases[alias] = _SqlTableReference(
-        schema: match.group(1),
-        table: match.group(2)!,
-      );
-    }
-    return aliases;
-  }
-
-  DatabaseTable? _findTable(
-    List<DatabaseSchema> schemas,
-    String? schemaName,
-    String tableName,
-  ) {
-    for (final schema in schemas) {
-      if (schemaName != null && schema.name != schemaName) continue;
-      for (final table in schema.tables) {
-        if (table.name == tableName) return table;
-      }
-    }
-    return null;
-  }
-
-  String _tableAlias(String tableName, Iterable<String> existingAliases) {
-    final parts = tableName
-        .split(RegExp(r'[_\W]+'))
-        .where((part) => part.isNotEmpty)
-        .toList();
-    var alias = parts.length > 1
-        ? parts.map((part) => part[0]).join()
-        : tableName.substring(0, tableName.length.clamp(1, 2));
-    alias = alias.toLowerCase();
-    final existing = existingAliases.map((item) => item.toLowerCase()).toSet();
-    if (!existing.contains(alias)) return alias;
-
-    var suffix = 2;
-    while (existing.contains('$alias$suffix')) {
-      suffix++;
-    }
-    return '$alias$suffix';
   }
 
   Future<void> _copyToClipboard(String text, String label) async {
@@ -2690,6 +3511,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   _OpenTableTab? get _activeTableTab {
+    if (_sqliteWorkbenchActive) return null;
     final tableIndex = _activeCenterTab - _sqlTabs.length;
     if (tableIndex < 0 || tableIndex >= _openTableTabs.length) {
       return null;
@@ -2698,6 +3520,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   _SqlScriptTab? get _activeSqlTab {
+    if (_sqliteWorkbenchActive) return null;
     if (_activeCenterTab < 0 || _activeCenterTab >= _sqlTabs.length) {
       return null;
     }
@@ -2714,9 +3537,56 @@ class _MyHomePageState extends State<MyHomePage> {
     return null;
   }
 
+  PostgresDatabase? get _currentDatabase {
+    if (_sqliteWorkbenchActive) return null;
+    final tableTab = _activeTableTab;
+    if (tableTab?.session case final PostgresSession session) {
+      return session.database;
+    }
+
+    final sqlTab = _activeSqlTab;
+    if (sqlTab != null && sqlTab.connectionKey != _globalScriptConnectionKey) {
+      return _connectionForKey(sqlTab.connectionKey)?.database;
+    }
+    return _database;
+  }
+
+  DatabaseSession? get _activeDatabaseSession {
+    final tableTab = _activeTableTab;
+    if (tableTab != null) return tableTab.session;
+
+    if (_activeMySqlConnection?.session != null) {
+      return _activeMySqlConnection!.session;
+    }
+
+    final sqlTab = _activeSqlTab;
+    if (sqlTab != null) {
+      final mysql = _mySqlConnectionForKey(sqlTab.connectionKey);
+      if (mysql?.session != null) return mysql!.session;
+      final postgres = _connectionForKey(sqlTab.connectionKey)?.database;
+      if (postgres != null) {
+        return PostgresSession(
+          profile: postgres.config,
+          database: postgres,
+          driver: _postgresDriver,
+        );
+      }
+    }
+
+    final postgres = _database;
+    if (postgres == null) return null;
+    return PostgresSession(
+      profile: postgres.config,
+      database: postgres,
+      driver: _postgresDriver,
+    );
+  }
+
   int get _tableTabOffset => _sqlTabs.length;
 
   String get _activeScriptConnectionKey {
+    final mySql = _activeMySqlConnection;
+    if (mySql != null) return _mySqlConnectionKey(mySql.config);
     final database = _database;
     if (database == null) return _globalScriptConnectionKey;
     return database.config.endpointName;
@@ -2730,50 +3600,29 @@ class _MyHomePageState extends State<MyHomePage> {
     return '"${identifier.replaceAll('"', '""')}"';
   }
 
-  String _buildTableDataSql(_OpenTableTab tab, {required int offset}) {
-    final filter = tab.filterController.text.trim();
-    final filters = [
-      if (filter.isNotEmpty) '($filter)',
-      for (final entry in tab.columnFilters.entries)
-        _columnFilterSql(entry.key, entry.value),
-    ];
-    final buffer = StringBuffer()
-      ..writeln('SELECT *')
-      ..writeln(
-        'FROM ${_quoteIdentifier(tab.schema)}.${_quoteIdentifier(tab.table)}',
-      );
-
-    if (filters.isNotEmpty) {
-      buffer.writeln('WHERE ${filters.join('\n  AND ')}');
-    }
-
-    if (tab.sortColumn != null) {
-      buffer.writeln(
-        'ORDER BY ${_quoteIdentifier(tab.sortColumn!)} ${tab.sortAscending ? 'ASC' : 'DESC'}',
-      );
-    } else if (tab.primaryKeyColumns.isNotEmpty) {
-      buffer.writeln(
-        'ORDER BY ${tab.primaryKeyColumns.map((column) => _quoteIdentifier(column.name)).join(', ')}',
-      );
-    }
-
-    buffer.write('LIMIT ${_OpenTableTab.pageSize + 1} OFFSET $offset;');
-    return buffer.toString();
-  }
-
-  String _columnFilterSql(String column, _ColumnFilter filter) {
-    final identifier = _quoteIdentifier(column);
+  String _columnFilterSql(
+    String column,
+    _ColumnFilter filter, {
+    DatabaseEngine engine = DatabaseEngine.postgresql,
+  }) {
+    final identifier = engine == DatabaseEngine.mysql
+        ? '`${column.replaceAll('`', '``')}`'
+        : _quoteIdentifier(column);
+    final textExpression = engine == DatabaseEngine.postgresql
+        ? '$identifier::text'
+        : 'CAST($identifier AS CHAR)';
+    final likeOperator = engine == DatabaseEngine.postgresql ? 'ILIKE' : 'LIKE';
     switch (filter.operator) {
       case 'is-null':
         return '$identifier IS NULL';
       case 'is-not-null':
         return '$identifier IS NOT NULL';
       case 'contains':
-        return '$identifier::text ILIKE ${_quoteSqlValue('%${filter.value}%')}';
+        return '$textExpression $likeOperator ${_quoteSqlValue('%${filter.value}%')}';
       case 'starts-with':
-        return '$identifier::text ILIKE ${_quoteSqlValue('${filter.value}%')}';
+        return '$textExpression $likeOperator ${_quoteSqlValue('${filter.value}%')}';
       case 'ends-with':
-        return '$identifier::text ILIKE ${_quoteSqlValue('%${filter.value}')}';
+        return '$textExpression $likeOperator ${_quoteSqlValue('%${filter.value}')}';
       case 'not-equals':
         return '$identifier <> ${_filterValue(filter)}';
       case 'greater-than':
@@ -2858,8 +3707,6 @@ class _MyHomePageState extends State<MyHomePage> {
   Widget build(BuildContext context) {
     return CallbackShortcuts(
       bindings: <ShortcutActivator, VoidCallback>{
-        const SingleActivator(LogicalKeyboardKey.enter, control: true):
-            _executeShortcut,
         const SingleActivator(LogicalKeyboardKey.f5): _executeShortcut,
         const SingleActivator(LogicalKeyboardKey.keyS, control: true):
             _saveShortcut,
@@ -2875,6 +3722,15 @@ class _MyHomePageState extends State<MyHomePage> {
       },
       child: Focus(
         autofocus: true,
+        onKeyEvent: (node, event) {
+          if (event is KeyDownEvent &&
+              event.logicalKey == LogicalKeyboardKey.keyW &&
+              HardwareKeyboard.instance.isControlPressed) {
+            _closeActiveCenterTab();
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.ignored;
+        },
         child: Scaffold(
           backgroundColor: Theme.of(context).colorScheme.surface,
           body: Column(
@@ -2924,7 +3780,10 @@ class _MyHomePageState extends State<MyHomePage> {
                 isConnecting: _isConnecting,
                 onNewConnection: _newConnection,
                 onNewSql: _newSqlScript,
-                onExecute: _isExecuting || _isConnecting ? null : _executeSql,
+                onExecute:
+                    _isExecuting || _isConnecting || _sqliteWorkbenchActive
+                    ? null
+                    : _executeSql,
                 onStop: _stopQuery,
                 onToggleNavigator: () {
                   setState(() {
@@ -2937,6 +3796,12 @@ class _MyHomePageState extends State<MyHomePage> {
                   });
                 },
                 onToggleAssistant: _showAiAssistant,
+                autoCommit: _currentDatabase?.autoCommit ?? true,
+                transactionActive: _currentDatabase?.transactionActive ?? false,
+                onAutoCommitChanged: (enabled) =>
+                    unawaited(_setAutoCommit(enabled)),
+                onCommit: () => unawaited(_commitTransaction()),
+                onRollback: () => unawaited(_rollbackTransaction()),
               ),
               Expanded(
                 child: IdeLayout(
@@ -2958,7 +3823,8 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget _buildCenterTabs() {
+  Widget _buildCenterTabs({ScrollController? controller}) {
+    final tabsController = controller ?? _centerTabsController;
     return Container(
       height: 34,
       color: Theme.of(context).colorScheme.surfaceContainer,
@@ -2967,20 +3833,30 @@ class _MyHomePageState extends State<MyHomePage> {
           _CenterTabScrollButton(
             tooltip: 'Scroll tabs left',
             icon: Icons.chevron_left,
-            onPressed: () => _scrollCenterTabs(-220),
+            onPressed: () =>
+                _scrollCenterTabs(-220, controller: tabsController),
           ),
           Expanded(
             child: SingleChildScrollView(
-              key: const ValueKey('center-tab-scroll-view'),
-              controller: _centerTabsController,
+              key: ValueKey(
+                identical(tabsController, _centerTabsController)
+                    ? 'center-tab-scroll-view'
+                    : identical(tabsController, _sqliteTabsController)
+                    ? 'sqlite-center-tab-scroll-view'
+                    : 'mysql-center-tab-scroll-view',
+              ),
+              controller: tabsController,
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: [
                   for (int i = 0; i < _sqlTabs.length; i++)
                     EditorTab(
                       title: _sqlTabs[i].title,
-                      active: _activeCenterTab == i,
-                      onTap: () => setState(() => _activeCenterTab = i),
+                      active: !_sqliteWorkbenchActive && _activeCenterTab == i,
+                      onTap: () => setState(() {
+                        _sqliteWorkbenchActive = false;
+                        _activeCenterTab = i;
+                      }),
                       onClose: () => _closeSqlTab(_sqlTabs[i]),
                       onSecondaryTapDown: (details) =>
                           _showCenterTabMenu(i, details.globalPosition),
@@ -2988,15 +3864,27 @@ class _MyHomePageState extends State<MyHomePage> {
                   for (int i = 0; i < _openTableTabs.length; i++)
                     EditorTab(
                       title: _openTableTabs[i].table,
-                      active: _activeCenterTab == _tableTabOffset + i,
-                      onTap: () => setState(
-                        () => _activeCenterTab = _tableTabOffset + i,
-                      ),
+                      active:
+                          !_sqliteWorkbenchActive &&
+                          _activeCenterTab == _tableTabOffset + i,
+                      onTap: () => setState(() {
+                        _sqliteWorkbenchActive = false;
+                        _activeCenterTab = _tableTabOffset + i;
+                      }),
                       onClose: () => _closeTableTab(_openTableTabs[i]),
                       onSecondaryTapDown: (details) => _showCenterTabMenu(
                         _tableTabOffset + i,
                         details.globalPosition,
                       ),
+                    ),
+                  if (_sqliteWorkbenchOpen)
+                    EditorTab(
+                      title: 'SQLite',
+                      active: _sqliteWorkbenchActive,
+                      onTap: () => setState(() {
+                        _sqliteWorkbenchActive = true;
+                      }),
+                      onClose: _closeSqliteWorkbench,
                     ),
                 ],
               ),
@@ -3005,21 +3893,22 @@ class _MyHomePageState extends State<MyHomePage> {
           _CenterTabScrollButton(
             tooltip: 'Scroll tabs right',
             icon: Icons.chevron_right,
-            onPressed: () => _scrollCenterTabs(220),
+            onPressed: () => _scrollCenterTabs(220, controller: tabsController),
           ),
         ],
       ),
     );
   }
 
-  void _scrollCenterTabs(double delta) {
-    if (!_centerTabsController.hasClients) return;
-    final position = _centerTabsController.position;
-    final target = (_centerTabsController.offset + delta).clamp(
+  void _scrollCenterTabs(double delta, {ScrollController? controller}) {
+    final tabsController = controller ?? _centerTabsController;
+    if (!tabsController.hasClients) return;
+    final position = tabsController.position;
+    final target = (tabsController.offset + delta).clamp(
       position.minScrollExtent,
       position.maxScrollExtent,
     );
-    _centerTabsController.animateTo(
+    tabsController.animateTo(
       target,
       duration: const Duration(milliseconds: 180),
       curve: Curves.easeOut,
@@ -3192,6 +4081,28 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Widget _buildNavigatorPanel(double animationProgress) {
+    final navigatorConnections = List<_OpenConnection>.of(_connections)
+      ..sort((left, right) {
+        final folder = left.config.folder.toLowerCase().compareTo(
+          right.config.folder.toLowerCase(),
+        );
+        return folder != 0
+            ? folder
+            : left.config.displayName.toLowerCase().compareTo(
+                right.config.displayName.toLowerCase(),
+              );
+      });
+    final mySqlConnections = List<_OpenMySqlConnection>.of(_mySqlConnections)
+      ..sort((left, right) {
+        final folder = left.config.folder.toLowerCase().compareTo(
+          right.config.folder.toLowerCase(),
+        );
+        return folder != 0
+            ? folder
+            : left.config.displayName.toLowerCase().compareTo(
+                right.config.displayName.toLowerCase(),
+              );
+      });
     return Container(
       color: Theme.of(context).colorScheme.surface,
       child: Column(
@@ -3209,117 +4120,100 @@ class _MyHomePageState extends State<MyHomePage> {
           Expanded(
             child: ListView(
               children: [
-                if (_connections.isEmpty)
+                if (_connections.isEmpty && _mySqlConnections.isEmpty)
                   Padding(
                     padding: const EdgeInsets.all(12),
                     child: Text(
-                      'Add a PostgreSQL connection to begin.',
+                      'Add a PostgreSQL, MySQL, or SQLite connection to begin.',
                       style: TextStyle(
                         fontSize: 12,
                         color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
                     ),
                   ),
-                for (final connection in _connections)
-                  _ConnectionTreeItem(
-                    connection: connection,
-                    active:
-                        connection.database != null &&
-                        connection.database == _database,
-                    onActivate: () {
-                      if (connection.database == null) {
-                        unawaited(_ensureConnection(connection));
-                      } else {
-                        _activateConnection(connection);
-                      }
-                    },
-                    onExpand: () => _ensureConnection(connection),
-                    onEdit: () => unawaited(_editConnection(connection)),
-                    onDelete: () => unawaited(_deleteConnection(connection)),
-                    onInvalidate: () =>
-                        unawaited(_invalidateConnection(connection)),
-                    onCopyName: () => unawaited(
-                      _copyToClipboard(
-                        connection.config.displayName,
-                        'connection name',
+                if (navigatorConnections.isNotEmpty)
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(12, 8, 8, 4),
+                    child: Text(
+                      'POSTGRESQL',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
-                    schemaBuilder: (schema) => _SchemaTreeItem(
-                      connectionKey: connection.config.endpointName,
-                      schema: schema,
-                      isLoading: _loadingSchemas.contains(
-                        _schemaLoadingKey(connection, schema.name),
-                      ),
-                      onExpand: () async {
-                        if (!await _ensureConnection(connection)) return;
-                        await _loadSchemaTables(connection, schema.name);
-                      },
-                      onSelectSchema: (schemaName) async {
-                        if (!await _ensureConnection(connection)) return;
-                        _selectSchema(schemaName);
-                      },
-                      onRefresh: () {
-                        unawaited(
-                          _ensureConnection(connection).then((connected) {
-                            if (connected) return _refreshSchemas();
-                          }),
-                        );
-                      },
-                      onCopyName: (name) =>
-                          _copyToClipboard(name, 'schema name'),
-                      onAddToAiContext: () =>
-                          unawaited(_attachNavigatorSchema(connection, schema)),
-                      tableBuilder: (table) {
-                        return _TableTreeItem(
-                          connectionKey: connection.config.endpointName,
-                          schema: schema.name,
-                          table: table,
-                          isLoading: _loadingTables.contains(
-                            connection.database == null
-                                ? ''
-                                : _tableLoadingKey(
-                                    connection.database!,
-                                    schema.name,
-                                    table.name,
-                                  ),
-                          ),
-                          onExpand: (schema, table) async {
-                            if (!await _ensureConnection(connection)) return;
-                            await _loadTableColumns(schema, table);
-                          },
-                          onOpenTable: (schema, table) async {
-                            if (!await _ensureConnection(connection)) return;
-                            _openTable(schema, table);
-                          },
-                          onGenerateSql: (schema, table, statement) async {
-                            if (!await _ensureConnection(connection)) return;
-                            await _generateTableSql(
-                              schema,
-                              table.name,
-                              statement,
-                            );
-                          },
-                          onOpenTableData: (schema, table) async {
-                            if (!await _ensureConnection(connection)) return;
-                            await _openTableData(schema, table);
-                          },
-                          onOpenTableProperties: (schema, table) async {
-                            if (!await _ensureConnection(connection)) return;
-                            await _openTableData(
-                              schema,
-                              table,
-                              initialTab: 'Properties',
-                            );
-                          },
-                          onCopyName: (name) =>
-                              _copyToClipboard(name, 'table name'),
-                          onAddToAiContext: () => unawaited(
-                            _attachNavigatorTable(
-                              connection,
-                              schema.name,
-                              table,
+                  ),
+                for (
+                  var connectionIndex = 0;
+                  connectionIndex < navigatorConnections.length;
+                  connectionIndex++
+                ) ...[
+                  if (navigatorConnections[connectionIndex].config.folder
+                          .trim()
+                          .isNotEmpty &&
+                      (connectionIndex == 0 ||
+                          navigatorConnections[connectionIndex - 1]
+                                  .config
+                                  .folder !=
+                              navigatorConnections[connectionIndex]
+                                  .config
+                                  .folder))
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 10, 8, 4),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.folder_outlined, size: 15),
+                          const SizedBox(width: 6),
+                          Text(
+                            navigatorConnections[connectionIndex].config.folder,
+                            style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
                             ),
                           ),
+                        ],
+                      ),
+                    ),
+                  Builder(
+                    builder: (context) {
+                      final connection = navigatorConnections[connectionIndex];
+                      return _ConnectionTreeItem(
+                        connection: connection,
+                        active:
+                            connection.database != null &&
+                            connection.database == _database,
+                        onActivate: () {
+                          if (connection.database == null) {
+                            unawaited(_ensureConnection(connection));
+                          } else {
+                            _activateConnection(connection);
+                          }
+                        },
+                        onExpand: () => _ensureConnection(connection),
+                        onEdit: () => unawaited(_editConnection(connection)),
+                        onDelete: () =>
+                            unawaited(_deleteConnection(connection)),
+                        onInvalidate: () =>
+                            unawaited(_invalidateConnection(connection)),
+                        onCopyName: () => unawaited(
+                          _copyToClipboard(
+                            connection.config.displayName,
+                            'connection name',
+                          ),
+                        ),
+                        schemaBuilder: (schema) => _SchemaTreeItem(
+                          connectionKey: connection.config.endpointName,
+                          schema: schema,
+                          isLoading: _loadingSchemas.contains(
+                            _schemaLoadingKey(connection, schema.name),
+                          ),
+                          onExpand: () async {
+                            if (!await _ensureConnection(connection)) return;
+                            await _loadSchemaTables(connection, schema.name);
+                          },
+                          onSelectSchema: (schemaName) async {
+                            if (!await _ensureConnection(connection)) return;
+                            _selectSchema(schemaName);
+                          },
                           onRefresh: () {
                             unawaited(
                               _ensureConnection(connection).then((connected) {
@@ -3327,9 +4221,161 @@ class _MyHomePageState extends State<MyHomePage> {
                               }),
                             );
                           },
-                        );
-                      },
+                          onCopyName: (name) =>
+                              _copyToClipboard(name, 'schema name'),
+                          onAddToAiContext: () => unawaited(
+                            _attachNavigatorSchema(connection, schema),
+                          ),
+                          tableBuilder: (table) {
+                            return _TableTreeItem(
+                              connectionKey: connection.config.endpointName,
+                              schema: schema.name,
+                              table: table,
+                              isLoading: _loadingTables.contains(
+                                connection.database == null
+                                    ? ''
+                                    : _tableLoadingKey(
+                                        connection.database!,
+                                        schema.name,
+                                        table.name,
+                                      ),
+                              ),
+                              onExpand: (schema, table) async {
+                                if (!await _ensureConnection(connection)) {
+                                  return;
+                                }
+                                await _loadTableColumns(schema, table);
+                              },
+                              onOpenTable: (schema, table) async {
+                                if (!await _ensureConnection(connection)) {
+                                  return;
+                                }
+                                _openTable(schema, table);
+                              },
+                              onGenerateSql: (schema, table, statement) async {
+                                if (!await _ensureConnection(connection)) {
+                                  return;
+                                }
+                                await _generateTableSql(
+                                  schema,
+                                  table.name,
+                                  statement,
+                                );
+                              },
+                              onOpenTableData: (schema, table) async {
+                                if (!await _ensureConnection(connection)) {
+                                  return;
+                                }
+                                await _openTableData(schema, table);
+                              },
+                              onOpenTableProperties: (schema, table) async {
+                                if (!await _ensureConnection(connection)) {
+                                  return;
+                                }
+                                await _openTableData(
+                                  schema,
+                                  table,
+                                  initialTab: 'Properties',
+                                );
+                              },
+                              onCopyName: (name) =>
+                                  _copyToClipboard(name, 'table name'),
+                              onAddToAiContext: () => unawaited(
+                                _attachNavigatorTable(
+                                  connection,
+                                  schema.name,
+                                  table,
+                                ),
+                              ),
+                              onRefresh: () {
+                                unawaited(
+                                  _ensureConnection(connection).then((
+                                    connected,
+                                  ) {
+                                    if (connected) return _refreshSchemas();
+                                  }),
+                                );
+                              },
+                            );
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                ],
+                if (mySqlConnections.isNotEmpty)
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(12, 12, 8, 4),
+                    child: Text(
+                      'MYSQL',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
+                  ),
+                for (final connection in mySqlConnections)
+                  _MySqlConnectionTreeItem(
+                    connection: connection,
+                    active:
+                        connection.database != null &&
+                        identical(_activeMySqlConnection, connection),
+                    onExpand: () => _ensureMySqlConnection(connection),
+                    onActivate: () {
+                      if (connection.database == null) {
+                        unawaited(_ensureMySqlConnection(connection));
+                      } else {
+                        _activateMySqlConnection(connection);
+                      }
+                    },
+                    onEdit: () => unawaited(_editMySqlConnection(connection)),
+                    onDelete: () =>
+                        unawaited(_deleteMySqlConnection(connection)),
+                    onInvalidate: () =>
+                        unawaited(_invalidateMySqlConnection(connection)),
+                    onOpenTable: (table) async {
+                      await _openMySqlTableData(connection, table);
+                    },
+                    onLoadTable: (table) async {
+                      final database = connection.database;
+                      if (database == null || table.columnsLoaded) return;
+                      final loaded = await database.loadTable(table.name);
+                      if (!mounted) return;
+                      setState(() {
+                        final index = connection.tables.indexWhere(
+                          (item) => item.name == table.name,
+                        );
+                        if (index >= 0) connection.tables[index] = loaded;
+                      });
+                    },
+                    onAttachTable: (table) async {
+                      if (!await _ensureMySqlConnection(connection)) return;
+                      var loaded = table;
+                      if (!loaded.columnsLoaded) {
+                        loaded = await connection.database!.loadTable(
+                          table.name,
+                        );
+                      }
+                      final buffer = StringBuffer()
+                        ..writeln(
+                          'Connection: ${connection.config.displayName}',
+                        )
+                        ..writeln(
+                          'MySQL database: ${connection.config.database}',
+                        )
+                        ..writeln('Table: ${loaded.name}')
+                        ..writeln('Columns:');
+                      for (final column in loaded.columns) {
+                        buffer.writeln(
+                          '- ${column.name}: ${column.dataType}'
+                          '${column.primaryKey ? ' PRIMARY KEY' : ''}',
+                        );
+                      }
+                      _attachMySqlContext(
+                        '${connection.config.database}.${loaded.name}',
+                        buffer.toString(),
+                      );
+                    },
                   ),
               ],
             ),
@@ -3340,6 +4386,42 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Widget _buildEditorPanel(double animationProgress) {
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: Offstage(
+            offstage: _sqliteWorkbenchActive,
+            child: TickerMode(
+              enabled: !_sqliteWorkbenchActive,
+              child: _buildPostgresEditorPanel(animationProgress),
+            ),
+          ),
+        ),
+        if (_sqliteWorkbenchOpen)
+          Positioned.fill(
+            child: Offstage(
+              offstage: !_sqliteWorkbenchActive,
+              child: TickerMode(
+                enabled: _sqliteWorkbenchActive,
+                child: Column(
+                  children: [
+                    _buildCenterTabs(controller: _sqliteTabsController),
+                    Expanded(
+                      child: SqliteWorkbenchPage(
+                        onClose: _closeSqliteWorkbench,
+                        onAttachContext: _attachSqliteContext,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildPostgresEditorPanel(double animationProgress) {
     if (_activeCenterTab >= _tableTabOffset) {
       final activeTab = _activeTableTab;
       if (activeTab != null) {
@@ -3561,6 +4643,48 @@ class _MyHomePageState extends State<MyHomePage> {
                     ),
                   ],
                   const Spacer(),
+                  if (activeTab == 'Data' && _statementResults.length > 1)
+                    PopupMenuButton<int>(
+                      tooltip: 'Select result set',
+                      initialValue: _activeStatementResult,
+                      onSelected: _selectStatementResult,
+                      itemBuilder: (context) => [
+                        for (
+                          var index = 0;
+                          index < _statementResults.length;
+                          index++
+                        )
+                          PopupMenuItem(
+                            value: index,
+                            child: Text(
+                              'Result ${index + 1}  '
+                              '(${_statementResults[index].rowCount} rows)',
+                            ),
+                          ),
+                      ],
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 7),
+                        child: Text(
+                          'Result ${_activeStatementResult + 1}/'
+                          '${_statementResults.length}',
+                          style: const TextStyle(fontSize: 11),
+                        ),
+                      ),
+                    ),
+                  if (activeTab == 'Data' && _columns.isNotEmpty)
+                    PopupMenuButton<String>(
+                      tooltip: 'Export result data',
+                      onSelected: (format) =>
+                          unawaited(_exportSqlResult(format)),
+                      itemBuilder: (context) => const [
+                        PopupMenuItem(value: 'csv', child: Text('Export CSV')),
+                        PopupMenuItem(
+                          value: 'json',
+                          child: Text('Export JSON'),
+                        ),
+                      ],
+                      icon: const Icon(Icons.download_outlined, size: 18),
+                    ),
                   if (activeTab == 'Data' && _resultColumnFilters.isNotEmpty)
                     IconButton(
                       tooltip: 'Clear all filters',
@@ -3603,6 +4727,13 @@ class _MyHomePageState extends State<MyHomePage> {
                       icon: const Icon(Icons.save_outlined, size: 18),
                     ),
                   ],
+                  if (activeTab == 'Messages' && _logs.isNotEmpty)
+                    IconButton(
+                      tooltip: 'Clear messages',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: _clearMessages,
+                      icon: const Icon(Icons.delete_sweep_outlined, size: 18),
+                    ),
                   if (showCount)
                     Text(
                       activeTab == 'Data'
@@ -3648,15 +4779,28 @@ class _MyHomePageState extends State<MyHomePage> {
                   _globalScriptConnectionKey,
                   for (final connection in _connections)
                     connection.config.endpointName,
+                  for (final connection in _mySqlConnections)
+                    _mySqlConnectionKey(connection.config),
                 ];
                 final selectedKey =
                     connectionKeys.contains(sqlTab.connectionKey)
                     ? sqlTab.connectionKey
-                    : _connectionForKey(
-                            sqlTab.connectionKey,
-                          )?.config.endpointName ??
-                          _globalScriptConnectionKey;
+                    : _globalScriptConnectionKey;
                 final selectedLabel = _scriptConnectionLabel(selectedKey);
+                final choices = [
+                  for (final connection in _connections)
+                    _SqlConnectionChoice(
+                      key: connection.config.endpointName,
+                      label: connection.config.displayName,
+                      engine: 'PostgreSQL',
+                    ),
+                  for (final connection in _mySqlConnections)
+                    _SqlConnectionChoice(
+                      key: _mySqlConnectionKey(connection.config),
+                      label: connection.config.displayName,
+                      engine: 'MySQL',
+                    ),
+                ];
 
                 return Row(
                   children: [
@@ -3681,7 +4825,7 @@ class _MyHomePageState extends State<MyHomePage> {
                         compact: compact,
                         value: selectedKey,
                         label: selectedLabel,
-                        connections: _connections,
+                        connections: choices,
                         globalKey: _globalScriptConnectionKey,
                         onChanged: (value) =>
                             unawaited(_setSqlTabConnection(sqlTab, value)),
@@ -3849,6 +4993,8 @@ class _MyHomePageState extends State<MyHomePage> {
               loadingMore: tab.loadingPage,
               onSaveChanges: () => unawaited(_saveTableChanges(tab)),
               onCancelChanges: () => _cancelTableChanges(tab),
+              onExport: (format) => unawaited(_exportTableData(tab, format)),
+              onImport: () => unawaited(_importCsvIntoTable(tab)),
             ),
             Expanded(
               child: ResultGrid(
@@ -3893,19 +5039,47 @@ class _MyHomePageState extends State<MyHomePage> {
           child: Row(
             children: [
               Expanded(
-                child: _RightPanelTab(
-                  label: 'Properties',
-                  icon: Icons.info_outline,
-                  active: _rightPanelMode == 'properties',
-                  onTap: () => setState(() => _rightPanelMode = 'properties'),
-                ),
-              ),
-              Expanded(
-                child: _RightPanelTab(
-                  label: 'AI Assistant',
-                  icon: Icons.auto_awesome_outlined,
-                  active: _rightPanelMode == 'assistant',
-                  onTap: _showAiAssistant,
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      _RightPanelTab(
+                        label: 'Properties',
+                        icon: Icons.info_outline,
+                        active: _rightPanelMode == 'properties',
+                        onTap: () =>
+                            setState(() => _rightPanelMode = 'properties'),
+                      ),
+                      _RightPanelTab(
+                        label: 'Search',
+                        icon: Icons.search,
+                        active: _rightPanelMode == 'search',
+                        onTap: () => setState(() => _rightPanelMode = 'search'),
+                      ),
+                      _RightPanelTab(
+                        label: 'History',
+                        icon: Icons.history,
+                        active: _rightPanelMode == 'history',
+                        onTap: () =>
+                            setState(() => _rightPanelMode = 'history'),
+                      ),
+                      _RightPanelTab(
+                        label: 'Sessions',
+                        icon: Icons.monitor_heart_outlined,
+                        active: _rightPanelMode == 'sessions',
+                        onTap: () {
+                          setState(() => _rightPanelMode = 'sessions');
+                          unawaited(_refreshSessions());
+                        },
+                      ),
+                      _RightPanelTab(
+                        label: 'AI',
+                        icon: Icons.auto_awesome_outlined,
+                        active: _rightPanelMode == 'assistant',
+                        onTap: _showAiAssistant,
+                      ),
+                    ],
+                  ),
                 ),
               ),
               IconButton(
@@ -3918,9 +5092,311 @@ class _MyHomePageState extends State<MyHomePage> {
           ),
         ),
         Expanded(
-          child: _rightPanelMode == 'assistant'
-              ? _buildAiAssistantPanel()
-              : _buildPropertiesContent(),
+          child: switch (_rightPanelMode) {
+            'assistant' => _buildAiAssistantPanel(),
+            'search' => _buildObjectSearchPanel(),
+            'history' => _buildSqlHistoryPanel(),
+            'sessions' => _buildSessionsPanel(),
+            _ => _buildPropertiesContent(),
+          },
+        ),
+      ],
+    );
+  }
+
+  Future<void> _searchDatabaseObjects() async {
+    final database = _currentDatabase;
+    final query = _objectSearchController.text.trim();
+    if (database == null || query.isEmpty) return;
+    setState(() => _objectSearching = true);
+    try {
+      final results = await database.searchObjects(query);
+      if (!mounted) return;
+      setState(() {
+        _objectSearchResults = results;
+        _objectSearching = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _objectSearching = false;
+        _logs.add('[ERROR] Object search failed: $error');
+      });
+    }
+  }
+
+  Widget _buildObjectSearchPanel() {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(8),
+          child: TextField(
+            key: const ValueKey('database-object-search'),
+            controller: _objectSearchController,
+            onSubmitted: (_) => unawaited(_searchDatabaseObjects()),
+            decoration: InputDecoration(
+              hintText: 'Tables, columns, views, functions',
+              prefixIcon: const Icon(Icons.search, size: 18),
+              suffixIcon: IconButton(
+                tooltip: 'Search database',
+                onPressed: _objectSearching
+                    ? null
+                    : () => unawaited(_searchDatabaseObjects()),
+                icon: const Icon(Icons.arrow_forward, size: 18),
+              ),
+            ),
+          ),
+        ),
+        if (_objectSearching) const LinearProgressIndicator(minHeight: 2),
+        Expanded(
+          child: _objectSearchResults.isEmpty
+              ? const Center(child: Text('No search results'))
+              : ListView.builder(
+                  itemCount: _objectSearchResults.length,
+                  itemBuilder: (context, index) {
+                    final item = _objectSearchResults[index];
+                    return ListTile(
+                      dense: true,
+                      leading: Icon(
+                        item.type == 'Column'
+                            ? Icons.view_column_outlined
+                            : item.type == 'Function'
+                            ? Icons.functions
+                            : Icons.table_chart_outlined,
+                        size: 17,
+                      ),
+                      title: Text(
+                        '${item.schema}.${item.name}',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(
+                        '${item.type}${item.detail.isEmpty ? '' : '  ${item.detail}'}',
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      onTap: () {
+                        final parts = item.name.split('.');
+                        final table = parts.first;
+                        if (item.type == 'Table' ||
+                            item.type == 'Partitioned table' ||
+                            item.type == 'View' ||
+                            item.type == 'Materialized view' ||
+                            item.type == 'Foreign table' ||
+                            item.type == 'Column') {
+                          final schema = _activeOpenConnection?.schemas
+                              .where((schema) => schema.name == item.schema)
+                              .firstOrNull;
+                          final metadata = schema?.tables
+                              .where((value) => value.name == table)
+                              .firstOrNull;
+                          if (metadata != null) {
+                            unawaited(_openTableData(item.schema, metadata));
+                          }
+                        }
+                      },
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSqlHistoryPanel() {
+    return Column(
+      children: [
+        Container(
+          height: 38,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Row(
+            children: [
+              Text(
+                '${_sqlHistory.length} executions',
+                style: const TextStyle(fontSize: 12),
+              ),
+              const Spacer(),
+              IconButton(
+                tooltip: 'Clear SQL history',
+                onPressed: _sqlHistory.isEmpty
+                    ? null
+                    : () async {
+                        await _historyStore.clear();
+                        if (mounted) setState(_sqlHistory.clear);
+                      },
+                icon: const Icon(Icons.delete_sweep_outlined, size: 18),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: _sqlHistory.isEmpty
+              ? const Center(child: Text('No SQL history'))
+              : ListView.builder(
+                  itemCount: _sqlHistory.length,
+                  itemBuilder: (context, index) {
+                    final item = _sqlHistory[index];
+                    return ListTile(
+                      dense: true,
+                      leading: Icon(
+                        item.succeeded
+                            ? Icons.check_circle_outline
+                            : Icons.error_outline,
+                        size: 17,
+                        color: item.succeeded
+                            ? Colors.green.shade700
+                            : Theme.of(context).colorScheme.error,
+                      ),
+                      title: Text(
+                        item.sql.replaceAll(RegExp(r'\s+'), ' ').trim(),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontFamily: 'Consolas',
+                          fontSize: 11,
+                        ),
+                      ),
+                      subtitle: Text(
+                        '${item.connection} | ${item.elapsedMilliseconds} ms | '
+                        '${item.rowCount} rows',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: IconButton(
+                        tooltip: 'Open and rerun',
+                        onPressed: () => _rerunHistory(item),
+                        icon: const Icon(Icons.replay, size: 17),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  void _rerunHistory(SqlHistoryEntry entry) {
+    final tab = _activeSqlTab;
+    if (tab == null) return;
+    setState(() {
+      tab.controller.text = entry.sql;
+      _activeCenterTab = _sqlTabs.indexOf(tab);
+    });
+    unawaited(_executeSql());
+  }
+
+  Future<void> _refreshSessions() async {
+    final session = _activeDatabaseSession;
+    if (session == null ||
+        !session.capabilities.sessionMonitor ||
+        _sessionsLoading) {
+      if (mounted && session != null) {
+        setState(() => _sessions = const []);
+      }
+      return;
+    }
+    setState(() => _sessionsLoading = true);
+    try {
+      final sessions = await session.loadSessions();
+      if (!mounted) return;
+      setState(() {
+        _sessions = sessions;
+        _sessionsLoading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _sessionsLoading = false;
+        _logs.add('[ERROR] Session monitor failed: $error');
+      });
+    }
+  }
+
+  Widget _buildSessionsPanel() {
+    final session = _activeDatabaseSession;
+    final engine = session?.profile.engine;
+    final engineName = switch (engine) {
+      DatabaseEngine.mysql => 'MySQL',
+      DatabaseEngine.sqlite => 'SQLite',
+      DatabaseEngine.postgresql => 'PostgreSQL',
+      null => 'Database',
+    };
+    return Column(
+      children: [
+        Container(
+          height: 38,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Row(
+            children: [
+              Text(
+                '$engineName sessions',
+                style: const TextStyle(fontSize: 12),
+              ),
+              const Spacer(),
+              IconButton(
+                tooltip: 'Refresh sessions',
+                onPressed: _sessionsLoading
+                    ? null
+                    : () => unawaited(_refreshSessions()),
+                icon: const Icon(Icons.refresh, size: 18),
+              ),
+            ],
+          ),
+        ),
+        if (_sessionsLoading) const LinearProgressIndicator(minHeight: 2),
+        Expanded(
+          child: _sessions.isEmpty
+              ? const Center(child: Text('No sessions loaded'))
+              : ListView.builder(
+                  itemCount: _sessions.length,
+                  itemBuilder: (context, index) {
+                    final session = _sessions[index];
+                    return ListTile(
+                      dense: true,
+                      leading: CircleAvatar(
+                        radius: 14,
+                        child: Text(
+                          '${session.id}',
+                          style: const TextStyle(fontSize: 9),
+                        ),
+                      ),
+                      title: Text(
+                        '${session.username} | ${session.state}',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(
+                        [
+                          session.application,
+                          if (session.waitEvent.isNotEmpty) session.waitEvent,
+                          if (session.lockCount > 0)
+                            '${session.lockCount} locks',
+                          if (session.blockingSessionIds.isNotEmpty)
+                            'blocked by ${session.blockingSessionIds.join(', ')}',
+                          session.query,
+                        ].where((value) => value.isNotEmpty).join('\n'),
+                        maxLines: 4,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: IconButton(
+                        tooltip: 'Cancel session query',
+                        onPressed: session.query.isEmpty
+                            ? null
+                            : () async {
+                                final cancelled = await _activeDatabaseSession
+                                    ?.cancelSession(session.id);
+                                if (!mounted) return;
+                                setState(() {
+                                  _logs.add(
+                                    cancelled == true
+                                        ? '[INFO] Cancelled session ${session.id}'
+                                        : '[WARN] Session ${session.id} could not be cancelled',
+                                  );
+                                });
+                                await _refreshSessions();
+                              },
+                        icon: const Icon(Icons.stop_circle_outlined, size: 18),
+                      ),
+                    );
+                  },
+                ),
         ),
       ],
     );
@@ -4146,11 +5622,13 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
                 const SizedBox(width: 6),
                 IconButton.filled(
-                  tooltip: 'Send (Ctrl+Enter)',
+                  tooltip: _aiSending
+                      ? 'Cancel AI request'
+                      : 'Send (Ctrl+Enter)',
                   onPressed: _aiSending
-                      ? null
+                      ? _cancelAiRequest
                       : () => unawaited(_sendAiPrompt()),
-                  icon: const Icon(Icons.send, size: 18),
+                  icon: Icon(_aiSending ? Icons.stop : Icons.send, size: 18),
                 ),
               ],
             ),
@@ -4167,6 +5645,7 @@ class _MyHomePageState extends State<MyHomePage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           BottomHeader(
+            onClear: _logs.isEmpty ? null : _clearMessages,
             onClose: () {
               setState(() {
                 _controller.toggleBottom();
@@ -4248,6 +5727,7 @@ class _RightPanelTab extends StatelessWidget {
       onTap: onTap,
       child: Container(
         height: 36,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
         decoration: BoxDecoration(
           color: active
               ? Theme.of(context).colorScheme.surface
@@ -4260,18 +5740,16 @@ class _RightPanelTab extends StatelessWidget {
           ),
         ),
         child: Row(
+          mainAxisSize: MainAxisSize.min,
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Icon(icon, size: 15),
             const SizedBox(width: 5),
-            Flexible(
-              child: Text(
-                label,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: active ? FontWeight.w600 : FontWeight.normal,
-                ),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: active ? FontWeight.w600 : FontWeight.normal,
               ),
             ),
           ],
@@ -4581,51 +6059,7 @@ class _SqlResultContext {
   });
 }
 
-class _OpenTableTab {
-  static const pageSize = 500;
-
-  final PostgresDatabase database;
-  final String connectionName;
-  final String schema;
-  final DatabaseTable metadata;
-  final TextEditingController filterController = TextEditingController();
-
-  String innerTab = 'Data';
-  String? sortColumn;
-  bool sortAscending = true;
-  final Map<String, _ColumnFilter> columnFilters = {};
-  final Map<int, Map<int, String>> pendingChanges = {};
-  List<String> resultColumns = [];
-  List<List<dynamic>> rows = [];
-  bool hasMoreRows = true;
-  bool loadingPage = false;
-
-  _OpenTableTab({
-    required this.database,
-    required this.connectionName,
-    required this.schema,
-    required this.metadata,
-  });
-
-  String get table => metadata.name;
-
-  List<DatabaseColumn> get columns => metadata.columns;
-
-  String get ddl => metadata.ddl;
-
-  String get id => '$schema.$table';
-
-  List<DatabaseColumn> get primaryKeyColumns =>
-      columns.where((column) => column.primaryKey).toList();
-
-  bool get canEdit =>
-      primaryKeyColumns.isNotEmpty &&
-      primaryKeyColumns.every((column) => resultColumns.contains(column.name));
-
-  void dispose() {
-    filterController.dispose();
-  }
-}
+typedef _OpenTableTab = WorkbenchTableTab<_ColumnFilter>;
 
 enum _ColumnFilterKind { text, number, boolean, dateTime }
 
@@ -5060,30 +6494,7 @@ class _SqlEditorError {
   }
 }
 
-class _SqlCompletion {
-  final String label;
-  final String detail;
-  final String text;
-  final int cursorOffset;
-  final String? schema;
-  final String? table;
-
-  const _SqlCompletion({
-    required this.label,
-    required this.detail,
-    required this.text,
-    required this.cursorOffset,
-    this.schema,
-    this.table,
-  });
-}
-
-class _SqlTableReference {
-  final String? schema;
-  final String table;
-
-  const _SqlTableReference({required this.schema, required this.table});
-}
+typedef _SqlCompletion = SqlCompletion;
 
 class _SqlCodeEditor extends StatefulWidget {
   final _SqlCodeController controller;
@@ -5582,16 +6993,175 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
   }
 }
 
-class _OpenConnection {
-  PostgresConnectionConfig config;
-  PostgresDatabase? database;
-  List<DatabaseSchema> schemas;
-  bool isConnecting = false;
-  String? connectionError;
+typedef _OpenMySqlConnection = OpenMySqlConnection;
 
-  _OpenConnection({required this.config, required List<DatabaseSchema> schemas})
-    : schemas = List<DatabaseSchema>.of(schemas);
+class _MySqlConnectionTreeItem extends StatelessWidget {
+  final _OpenMySqlConnection connection;
+  final bool active;
+  final Future<bool> Function() onExpand;
+  final VoidCallback onActivate;
+  final VoidCallback onEdit;
+  final VoidCallback onDelete;
+  final VoidCallback onInvalidate;
+  final Future<void> Function(DatabaseTable table) onLoadTable;
+  final Future<void> Function(DatabaseTable table) onOpenTable;
+  final Future<void> Function(DatabaseTable table) onAttachTable;
+
+  const _MySqlConnectionTreeItem({
+    required this.connection,
+    required this.active,
+    required this.onExpand,
+    required this.onActivate,
+    required this.onEdit,
+    required this.onDelete,
+    required this.onInvalidate,
+    required this.onLoadTable,
+    required this.onOpenTable,
+    required this.onAttachTable,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final connected = connection.database != null;
+    return DatabaseConnectionTreeTile(
+      storageKey: 'mysql-${connection.config.endpointName}',
+      name: connection.config.displayName,
+      connected: connected,
+      active: active,
+      connecting: connection.isConnecting,
+      error: connection.connectionError,
+      tags: connection.config.tags,
+      onExpand: () async {
+        await onExpand();
+      },
+      onActivate: onActivate,
+      menuItems: [
+        PopupMenuItem(
+          value: connected ? 'activate' : 'connect',
+          child: DatabaseMenuAction(connected ? 'Set active' : 'Connect'),
+        ),
+        const PopupMenuItem(value: 'edit', child: DatabaseMenuAction('Edit')),
+        PopupMenuItem(
+          value: 'invalidate',
+          enabled: connected,
+          child: const DatabaseMenuAction('Invalidate connection'),
+        ),
+        const PopupMenuItem(
+          value: 'delete',
+          child: DatabaseMenuAction('Delete'),
+        ),
+      ],
+      onMenuSelected: (value) {
+        switch (value) {
+          case 'activate':
+          case 'connect':
+            onActivate();
+            break;
+          case 'edit':
+            onEdit();
+            break;
+          case 'invalidate':
+            onInvalidate();
+            break;
+          case 'delete':
+            onDelete();
+            break;
+        }
+      },
+      children: [
+        if (connection.isConnecting)
+          const TreeItem(
+            icon: Icons.sync,
+            title: 'Connecting...',
+            level: 1,
+            showArrow: false,
+          )
+        else if (connection.connectionError != null)
+          TreeItem(
+            icon: Icons.error_outline,
+            title: 'Connection failed',
+            level: 1,
+            showArrow: false,
+            onTap: () => unawaited(onExpand()),
+          )
+        else if (!connected)
+          const TreeItem(
+            icon: Icons.power_settings_new,
+            title: 'Expand to connect',
+            level: 1,
+            showArrow: false,
+          )
+        else
+          for (final table in connection.tables)
+            ExpansionTile(
+              key: PageStorageKey(
+                'mysql-table-${connection.config.endpointName}-${table.name}',
+              ),
+              dense: true,
+              tilePadding: const EdgeInsets.only(left: 26, right: 8),
+              shape: const Border(),
+              collapsedShape: const Border(),
+              leading: Icon(
+                table.relationType == 'View'
+                    ? Icons.visibility_outlined
+                    : Icons.table_chart_outlined,
+                size: 15,
+              ),
+              title: DatabaseContextMenuRegion(
+                menuItems: const [
+                  PopupMenuItem(
+                    value: 'open',
+                    child: DatabaseMenuAction('Open Data'),
+                  ),
+                  PopupMenuItem(
+                    value: 'context',
+                    child: DatabaseMenuAction('Add to AI context'),
+                  ),
+                ],
+                onSelected: (value) {
+                  if (value == 'open') {
+                    unawaited(onOpenTable(table));
+                  } else if (value == 'context') {
+                    unawaited(onAttachTable(table));
+                  }
+                },
+                child: GestureDetector(
+                  onDoubleTap: () => unawaited(onOpenTable(table)),
+                  child: Text(
+                    table.name,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ),
+              ),
+              trailing: IconButton(
+                tooltip: 'Add table to AI context',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => unawaited(onAttachTable(table)),
+                icon: const Icon(Icons.add_link_outlined, size: 15),
+              ),
+              onExpansionChanged: (expanded) {
+                if (expanded) unawaited(onLoadTable(table));
+              },
+              children: [
+                if (table.columnsLoaded)
+                  for (final column in table.columns)
+                    TreeItem(
+                      icon: column.primaryKey
+                          ? Icons.key_outlined
+                          : Icons.view_column_outlined,
+                      title: '${column.name}  ${column.dataType}',
+                      level: 2,
+                      showArrow: false,
+                    ),
+              ],
+            ),
+      ],
+    );
+  }
 }
+
+typedef _OpenConnection = OpenPostgresConnection;
 
 class _ConnectionTreeItem extends StatelessWidget {
   final _OpenConnection connection;
@@ -5619,29 +7189,42 @@ class _ConnectionTreeItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final connected = connection.database != null;
-
-    return _ContextMenuRegion(
+    return DatabaseConnectionTreeTile(
+      storageKey: 'connection-${connection.config.endpointName}',
+      name: connection.config.displayName,
+      connected: connected,
+      active: active,
+      connecting: connection.isConnecting,
+      error: connection.connectionError,
+      tags: connection.config.tags,
+      onExpand: () async {
+        await onExpand();
+      },
+      onActivate: onActivate,
       menuItems: [
         PopupMenuItem(
           value: connected ? 'activate' : 'connect',
-          child: _MenuAction(connected ? 'Set active' : 'Connect'),
+          child: DatabaseMenuAction(connected ? 'Set active' : 'Connect'),
         ),
         const PopupMenuItem(
           value: 'edit',
-          child: _MenuAction('Edit connection'),
+          child: DatabaseMenuAction('Edit connection'),
         ),
         PopupMenuItem(
           value: 'invalidate',
           enabled: connected,
-          child: const _MenuAction('Invalidate connection'),
+          child: const DatabaseMenuAction('Invalidate connection'),
         ),
-        const PopupMenuItem(value: 'copy', child: _MenuAction('Copy name')),
+        const PopupMenuItem(
+          value: 'copy',
+          child: DatabaseMenuAction('Copy name'),
+        ),
         const PopupMenuItem(
           value: 'delete',
-          child: _MenuAction('Delete connection'),
+          child: DatabaseMenuAction('Delete connection'),
         ),
       ],
-      onSelected: (value) {
+      onMenuSelected: (value) {
         switch (value) {
           case 'activate':
           case 'connect':
@@ -5661,76 +7244,31 @@ class _ConnectionTreeItem extends StatelessWidget {
             break;
         }
       },
-      child: ExpansionTile(
-        key: PageStorageKey('connection-${connection.config.endpointName}'),
-        dense: true,
-        initiallyExpanded: active,
-        onExpansionChanged: (expanded) {
-          if (expanded) {
-            unawaited(onExpand());
-          }
-        },
-        tilePadding: const EdgeInsets.only(left: 4, right: 8),
-        leading: Icon(
-          connected ? Icons.dns : Icons.storage_outlined,
-          size: 16,
-          color: active
-              ? Colors.green.shade700
-              : connection.connectionError == null
-              ? Colors.blueGrey
-              : Colors.red.shade700,
-        ),
-        title: InkWell(
-          onTap: onActivate,
-          child: _HoverTitle(
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    connection.config.displayName,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: active ? FontWeight.w600 : FontWeight.normal,
-                    ),
-                  ),
-                ),
-                if (connection.isConnecting)
-                  const SizedBox(
-                    width: 12,
-                    height: 12,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-              ],
-            ),
+      children: [
+        if (connection.isConnecting)
+          const TreeItem(
+            icon: Icons.sync,
+            title: 'Connecting...',
+            level: 1,
+            showArrow: false,
+          )
+        else if (connection.connectionError != null)
+          TreeItem(
+            icon: Icons.error_outline,
+            title: 'Connection failed',
+            level: 1,
+            showArrow: false,
+            onTap: () => unawaited(onExpand()),
+          )
+        else if (!connected)
+          const TreeItem(
+            icon: Icons.power_settings_new,
+            title: 'Expand to connect',
+            level: 1,
+            showArrow: false,
           ),
-        ),
-        children: [
-          if (connection.isConnecting)
-            const TreeItem(
-              icon: Icons.sync,
-              title: 'Connecting...',
-              level: 1,
-              showArrow: false,
-            )
-          else if (connection.connectionError != null)
-            TreeItem(
-              icon: Icons.error_outline,
-              title: 'Connection failed',
-              level: 1,
-              showArrow: false,
-              onTap: () => unawaited(onExpand()),
-            )
-          else if (!connected)
-            const TreeItem(
-              icon: Icons.power_settings_new,
-              title: 'Expand to connect',
-              level: 1,
-              showArrow: false,
-            ),
-          for (final schema in connection.schemas) schemaBuilder(schema),
-        ],
-      ),
+        for (final schema in connection.schemas) schemaBuilder(schema),
+      ],
     );
   }
 }
@@ -5784,18 +7322,18 @@ class _SchemaTreeItemState extends State<_SchemaTreeItem> {
 
   @override
   Widget build(BuildContext context) {
-    return _ContextMenuRegion(
+    return DatabaseContextMenuRegion(
       menuItems: [
-        PopupMenuItem(value: 'select', child: _MenuAction('Set active')),
-        PopupMenuItem(value: 'refresh', child: _MenuAction('Refresh')),
-        PopupMenuItem(value: 'copy', child: _MenuAction('Copy name')),
+        PopupMenuItem(value: 'select', child: DatabaseMenuAction('Set active')),
+        PopupMenuItem(value: 'refresh', child: DatabaseMenuAction('Refresh')),
+        PopupMenuItem(value: 'copy', child: DatabaseMenuAction('Copy name')),
         PopupMenuItem(
           value: 'ai-context',
-          child: _MenuAction('Add to AI context'),
+          child: DatabaseMenuAction('Add to AI context'),
         ),
         PopupMenuItem(
           value: 'properties',
-          child: _MenuAction('View properties'),
+          child: DatabaseMenuAction('View properties'),
         ),
       ],
       onSelected: (value) {
@@ -5828,7 +7366,7 @@ class _SchemaTreeItemState extends State<_SchemaTreeItem> {
         },
         tilePadding: const EdgeInsets.only(left: 22, right: 8),
         leading: const Icon(Icons.folder, size: 16, color: Colors.blueGrey),
-        title: _HoverTitle(
+        title: DatabaseHoverTitle(
           child: Text(widget.schema.name, style: const TextStyle(fontSize: 13)),
         ),
         children: [
@@ -5922,23 +7460,26 @@ class _TableTreeItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return _ContextMenuRegion(
+    return DatabaseContextMenuRegion(
       menuItems: [
-        PopupMenuItem(value: 'open-data', child: _MenuAction('View data')),
-        PopupMenuItem(enabled: false, child: _MenuAction('Generate')),
-        PopupMenuItem(value: 'select', child: _MenuAction('  SELECT')),
-        PopupMenuItem(value: 'insert', child: _MenuAction('  INSERT')),
-        PopupMenuItem(value: 'update', child: _MenuAction('  UPDATE')),
-        PopupMenuItem(value: 'delete', child: _MenuAction('  DELETE')),
-        PopupMenuItem(value: 'refresh', child: _MenuAction('Refresh')),
-        PopupMenuItem(value: 'copy', child: _MenuAction('Copy name')),
+        PopupMenuItem(
+          value: 'open-data',
+          child: DatabaseMenuAction('View data'),
+        ),
+        PopupMenuItem(enabled: false, child: DatabaseMenuAction('Generate')),
+        PopupMenuItem(value: 'select', child: DatabaseMenuAction('  SELECT')),
+        PopupMenuItem(value: 'insert', child: DatabaseMenuAction('  INSERT')),
+        PopupMenuItem(value: 'update', child: DatabaseMenuAction('  UPDATE')),
+        PopupMenuItem(value: 'delete', child: DatabaseMenuAction('  DELETE')),
+        PopupMenuItem(value: 'refresh', child: DatabaseMenuAction('Refresh')),
+        PopupMenuItem(value: 'copy', child: DatabaseMenuAction('Copy name')),
         PopupMenuItem(
           value: 'ai-context',
-          child: _MenuAction('Add to AI context'),
+          child: DatabaseMenuAction('Add to AI context'),
         ),
         PopupMenuItem(
           value: 'properties',
-          child: _MenuAction('View properties'),
+          child: DatabaseMenuAction('View properties'),
         ),
       ],
       onSelected: (value) {
@@ -5979,7 +7520,7 @@ class _TableTreeItem extends StatelessWidget {
         title: InkWell(
           onTap: () => unawaited(onOpenTable(schema, table.name)),
           onDoubleTap: () => unawaited(onOpenTableData(schema, table)),
-          child: _HoverTitle(
+          child: DatabaseHoverTitle(
             child: Text(table.name, style: const TextStyle(fontSize: 13)),
           ),
         ),
@@ -6162,85 +7703,6 @@ class _TableMetadataFolder extends StatelessWidget {
   }
 }
 
-class _HoverTitle extends StatefulWidget {
-  final Widget child;
-
-  const _HoverTitle({required this.child});
-
-  @override
-  State<_HoverTitle> createState() => _HoverTitleState();
-}
-
-class _HoverTitleState extends State<_HoverTitle> {
-  bool _hovering = false;
-
-  @override
-  Widget build(BuildContext context) {
-    return MouseRegion(
-      onEnter: (_) => setState(() => _hovering = true),
-      onExit: (_) => setState(() => _hovering = false),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 80),
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
-        decoration: BoxDecoration(
-          color: _hovering
-              ? Theme.of(context).colorScheme.primaryContainer
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(4),
-        ),
-        child: widget.child,
-      ),
-    );
-  }
-}
-
-class _ContextMenuRegion extends StatelessWidget {
-  final Widget child;
-  final List<PopupMenuEntry<String>> menuItems;
-  final ValueChanged<String> onSelected;
-
-  const _ContextMenuRegion({
-    required this.child,
-    required this.menuItems,
-    required this.onSelected,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent,
-      onSecondaryTapDown: (details) async {
-        final value = await showMenu<String>(
-          context: context,
-          position: RelativeRect.fromLTRB(
-            details.globalPosition.dx,
-            details.globalPosition.dy,
-            details.globalPosition.dx,
-            details.globalPosition.dy,
-          ),
-          items: menuItems,
-        );
-
-        if (value != null) {
-          onSelected(value);
-        }
-      },
-      child: child,
-    );
-  }
-}
-
-class _MenuAction extends StatelessWidget {
-  final String label;
-
-  const _MenuAction(this.label);
-
-  @override
-  Widget build(BuildContext context) {
-    return Text(label, style: const TextStyle(fontSize: 13));
-  }
-}
-
 class _GridRendererControl extends StatelessWidget {
   final ResultGridRenderer value;
   final bool compact;
@@ -6328,7 +7790,7 @@ class _SqlConnectionSelector extends StatelessWidget {
   final bool compact;
   final String value;
   final String label;
-  final List<_OpenConnection> connections;
+  final List<_SqlConnectionChoice> connections;
   final String globalKey;
   final ValueChanged<String> onChanged;
 
@@ -6361,8 +7823,8 @@ class _SqlConnectionSelector extends StatelessWidget {
             PopupMenuItem(value: globalKey, child: const Text('No connection')),
             for (final connection in connections)
               PopupMenuItem(
-                value: connection.config.endpointName,
-                child: Text(connection.config.displayName),
+                value: connection.key,
+                child: Text('${connection.label} (${connection.engine})'),
               ),
           ],
         ),
@@ -6382,9 +7844,9 @@ class _SqlConnectionSelector extends StatelessWidget {
           ),
           for (final connection in connections)
             DropdownMenuItem(
-              value: connection.config.endpointName,
+              value: connection.key,
               child: Text(
-                connection.config.displayName,
+                '${connection.label} (${connection.engine})',
                 overflow: TextOverflow.ellipsis,
                 maxLines: 1,
               ),
@@ -6396,6 +7858,18 @@ class _SqlConnectionSelector extends StatelessWidget {
       ),
     );
   }
+}
+
+class _SqlConnectionChoice {
+  final String key;
+  final String label;
+  final String engine;
+
+  const _SqlConnectionChoice({
+    required this.key,
+    required this.label,
+    required this.engine,
+  });
 }
 
 class _CompactResultTab extends StatelessWidget {
@@ -6508,6 +7982,8 @@ class _TableDataBrowserBar extends StatelessWidget {
   final bool loadingMore;
   final VoidCallback onSaveChanges;
   final VoidCallback onCancelChanges;
+  final ValueChanged<String> onExport;
+  final VoidCallback onImport;
 
   const _TableDataBrowserBar({
     required this.schema,
@@ -6524,6 +8000,8 @@ class _TableDataBrowserBar extends StatelessWidget {
     required this.loadingMore,
     required this.onSaveChanges,
     required this.onCancelChanges,
+    required this.onExport,
+    required this.onImport,
   });
 
   @override
@@ -6601,6 +8079,33 @@ class _TableDataBrowserBar extends StatelessWidget {
                   onPressed: isExecuting ? null : onRefresh,
                   icon: const Icon(Icons.refresh, size: 18),
                 ),
+                PopupMenuButton<String>(
+                  tooltip: 'Import or export data',
+                  onSelected: (value) {
+                    if (value == 'import') {
+                      onImport();
+                    } else {
+                      onExport(value);
+                    }
+                  },
+                  itemBuilder: (context) => [
+                    const PopupMenuItem(
+                      value: 'csv',
+                      child: Text('Export CSV'),
+                    ),
+                    const PopupMenuItem(
+                      value: 'json',
+                      child: Text('Export JSON'),
+                    ),
+                    const PopupMenuDivider(),
+                    PopupMenuItem(
+                      value: 'import',
+                      enabled: canEdit && !isExecuting,
+                      child: const Text('Import CSV'),
+                    ),
+                  ],
+                  icon: const Icon(Icons.import_export, size: 18),
+                ),
               ],
               if (!medium) ...[
                 IconButton(
@@ -6640,6 +8145,12 @@ class _TableDataBrowserBar extends StatelessWidget {
                         onCancelChanges();
                       case 'close':
                         onClose();
+                      case 'export-csv':
+                        onExport('csv');
+                      case 'export-json':
+                        onExport('json');
+                      case 'import':
+                        onImport();
                     }
                   },
                   itemBuilder: (context) => [
@@ -6663,6 +8174,20 @@ class _TableDataBrowserBar extends StatelessWidget {
                       value: 'cancel',
                       enabled: hasChanges && !isExecuting,
                       child: const Text('Cancel changes'),
+                    ),
+                    const PopupMenuDivider(),
+                    const PopupMenuItem(
+                      value: 'export-csv',
+                      child: Text('Export CSV'),
+                    ),
+                    const PopupMenuItem(
+                      value: 'export-json',
+                      child: Text('Export JSON'),
+                    ),
+                    PopupMenuItem(
+                      value: 'import',
+                      enabled: canEdit && !isExecuting,
+                      child: const Text('Import CSV'),
                     ),
                     const PopupMenuDivider(),
                     const PopupMenuItem(

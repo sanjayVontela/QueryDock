@@ -165,10 +165,6 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
-  if (message == WM_ACTIVATEAPP && !wparam) {
-    ResetPhysicalKeyState();
-  }
-
   // Windows may emit auto-repeat messages for a held modifier. Some Flutter
   // engine versions classify those as another KeyDownEvent instead of a
   // KeyRepeatEvent, which violates HardwareKeyboard's state invariant.
@@ -210,9 +206,7 @@ LRESULT CALLBACK FlutterWindow::FlutterViewWindowProc(
 LRESULT FlutterWindow::HandleFlutterViewMessage(
     HWND window, UINT const message, WPARAM const wparam,
     LPARAM const lparam) noexcept {
-  if (message == WM_KILLFOCUS || message == WM_CANCELMODE) {
-    ResetPhysicalKeyState();
-  } else if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+  if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
     // A delayed Alt/Ctrl/Shift message can arrive after focus changes with no
     // corresponding Windows modifier state. Forwarding it gives Flutter a
     // RawKeyDownEvent with modifiers == 0, which violates RawKeyboard's state
@@ -223,19 +217,10 @@ LRESULT FlutterWindow::HandleFlutterViewMessage(
 
     const UINT key_id = PhysicalKeyId(wparam, lparam);
     if (!pressed_physical_keys_.insert(key_id).second) {
-      if (IsModifierKey(wparam)) {
+      const bool is_repeat = (lparam & (1LL << 30)) != 0;
+      if (IsModifierKey(wparam) || !is_repeat) {
         return 0;
       }
-
-      // Some Windows/Flutter combinations report an auto-repeat as another
-      // KeyDownEvent. Repair the sequence so HardwareKeyboard receives a
-      // regular up/down pair while held letters, arrows, and Backspace still
-      // repeat normally.
-      const UINT key_up_message =
-          message == WM_SYSKEYDOWN ? WM_SYSKEYUP : WM_KEYUP;
-      const LPARAM key_up_flags = lparam | (1LL << 30) | (1LL << 31);
-      CallWindowProc(original_flutter_view_proc_, window, key_up_message,
-                     wparam, key_up_flags);
     }
   } else if (message == WM_KEYUP || message == WM_SYSKEYUP) {
     const bool was_pressed =

@@ -1,9 +1,36 @@
 # QueryDock
 
-QueryDock is a cross-platform PostgreSQL(for now) workbench built with Flutter. It
-provides a database navigator, SQL editor and autocomplete, editable result
-grids, schema diagrams, connection protection, and optional AI-assisted query
+QueryDock is a cross-platform PostgreSQL, MySQL/MariaDB, and SQLite workbench
+built with Flutter. It provides database navigators, SQL editors, result grids,
+schema metadata, connection protection, and optional AI-assisted query
 generation.
+
+Workbench features include manual transaction controls, multiple SQL result
+sets, CSV/JSON export, CSV import, SQL execution history, database object
+search, PostgreSQL session monitoring, and connection folders/tags.
+
+SSH tunneling uses the operating system's `ssh` command with a private key or
+SSH agent. Install OpenSSH and verify `ssh -V` works before enabling a tunnel
+in a connection profile.
+
+## SQLite
+
+Select **New Connection > SQLite** to open the SQLite workbench. It can open or
+create `.db`, `.sqlite`, and `.sqlite3` files, remembers recent files, displays
+tables, views, columns, keys, and indexes, executes selected SQL with
+`Ctrl+Enter`, supports multiple result sets, and exports results as CSV or JSON.
+SQLite is bundled by the Dart package, so users do not need to install a
+separate SQLite runtime.
+
+## MySQL And MariaDB
+
+Select **New Connection > MySQL** to save a MySQL profile in the main Database
+Navigator. MySQL uses the same QueryDock editor tabs, connection selector,
+result grid, history, export actions, and AI panel as PostgreSQL. Profiles
+support custom names, folders, tags, TLS, and passwords stored in the operating
+system's secure credential storage. The navigator displays tables, views,
+columns, indexes, and foreign keys. Disable TLS only for a trusted local
+development server.
 
 ## Download
 
