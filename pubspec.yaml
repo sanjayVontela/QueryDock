@@ -34,6 +34,7 @@ dev_dependencies:
     sdk: flutter
 
   flutter_lints: ^6.0.0
+  msix: ^3.17.0
 
 flutter:
 
@@ -65,3 +66,14 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+msix_config:
+  display_name: QueryDock
+  publisher_display_name: QueryDock
+  identity_name: SanjayVontela.QueryDock
+  publisher: CN=QueryDock
+  msix_version: 1.0.0.0
+  logo_path: assets/branding/querydock_app_icon.png
+  capabilities: internetClient
+  store: false
+  install_certificate: false
