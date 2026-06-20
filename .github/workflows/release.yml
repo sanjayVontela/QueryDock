@@ -48,6 +48,9 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
       - name: Analyze
         run: dart analyze
 
@@ -60,26 +63,45 @@ jobs:
       - name: Build MSIX installer
         run: dart run msix:create --build-windows false --install-certificate false
 
+      - name: Build EXE installer
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $cleanVersion = $version.TrimStart("v")
+          New-Item -ItemType Directory -Force -Path dist\installer
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            /DMyAppVersion="$cleanVersion" `
+            /DMyAppSource="..\build\windows\x64\runner\Release" `
+            /DMyAppOutput="..\dist\installer" `
+            installer\querydock.iss
+
       - name: Package release
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}"
+          $cleanVersion = $version.TrimStart("v")
           $source = "build/windows/x64/runner/Release"
           $stage = "QueryDock-$version-windows-x64"
           $archive = "$stage.zip"
           $msixSource = Get-ChildItem -Path $source -Filter "*.msix" | Select-Object -First 1
           $msix = "QueryDock-$version-windows-x64.msix"
+          $setupSource = "dist/installer/QueryDock-$cleanVersion-windows-x64-setup.exe"
+          $setup = "QueryDock-$version-windows-x64-setup.exe"
 
           New-Item -ItemType Directory -Path $stage
           Get-ChildItem -Path $source | Where-Object { $_.Extension -ne ".msix" } | Copy-Item -Destination $stage -Recurse
           Compress-Archive -Path "$stage/*" -DestinationPath $archive
           if ($null -eq $msixSource) { throw "MSIX package was not created" }
           Copy-Item -Path $msixSource.FullName -Destination $msix
+          if (!(Test-Path $setupSource)) { throw "EXE installer was not created" }
+          Copy-Item -Path $setupSource -Destination $setup
 
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
           "$hash  $archive" | Set-Content -Encoding ascii "$archive.sha256"
           $msixHash = (Get-FileHash -Algorithm SHA256 $msix).Hash.ToLower()
           "$msixHash  $msix" | Set-Content -Encoding ascii "$msix.sha256"
+          $setupHash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLower()
+          "$setupHash  $setup" | Set-Content -Encoding ascii "$setup.sha256"
 
       - name: Publish GitHub release
         env:
@@ -90,5 +112,7 @@ jobs:
           "QueryDock-${{ github.ref_name }}-windows-x64.zip.sha256"
           "QueryDock-${{ github.ref_name }}-windows-x64.msix"
           "QueryDock-${{ github.ref_name }}-windows-x64.msix.sha256"
+          "QueryDock-${{ github.ref_name }}-windows-x64-setup.exe"
+          "QueryDock-${{ github.ref_name }}-windows-x64-setup.exe.sha256"
           --title "QueryDock ${{ github.ref_name }}"
           --generate-notes
