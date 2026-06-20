@@ -1,6 +1,6 @@
 import '../models/database_schema.dart';
 
-enum DatabaseEngine { postgresql, mysql, sqlite }
+enum DatabaseEngine { postgresql, mysql, sqlite, db2 }
 
 class DatabaseCapabilities {
   final bool schemas;

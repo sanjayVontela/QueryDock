@@ -15,6 +15,7 @@ import '../database/models/database_schema.dart';
 import '../database/services/postgres_database.dart';
 import '../database/services/sqlite_database.dart';
 import 'widgets/db_viewer_widgets.dart';
+import 'widgets/workbench_center.dart';
 
 class SqliteWorkbenchPage extends StatefulWidget {
   final VoidCallback onClose;
@@ -442,74 +443,93 @@ class _SqliteWorkbenchPageState extends State<SqliteWorkbenchPage> {
 
   Widget _buildWorkspace() {
     final dark = Theme.of(context).brightness == Brightness.dark;
-    return Column(
-      children: [
-        SizedBox(
-          height: 270,
-          child: CodeTheme(
-            data: CodeThemeData(styles: dark ? atomOneDarkTheme : githubTheme),
-            child: CodeField(
-              controller: _editor,
-              focusNode: _editorFocus,
-              expands: true,
-              wrap: false,
-              textStyle: const TextStyle(
-                fontFamily: 'Consolas',
-                fontSize: 13,
-                height: 1.45,
+    return WorkbenchCenterScaffold(
+      editor: WorkbenchEditorSurface(
+        toolbar: Row(
+          children: [
+            const Icon(Icons.terminal, size: 16, color: Colors.blueGrey),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                _database == null
+                    ? 'No SQLite database selected'
+                    : 'Connection: ${_database!.displayName}',
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 12),
               ),
             ),
+            IconButton(
+              tooltip: 'Execute SQLite SQL',
+              onPressed: _database == null || _loading
+                  ? null
+                  : () => unawaited(_execute()),
+              icon: const Icon(Icons.play_arrow, size: 18),
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+            ),
+          ],
+        ),
+        editor: CodeTheme(
+          data: CodeThemeData(styles: dark ? atomOneDarkTheme : githubTheme),
+          child: CodeField(
+            controller: _editor,
+            focusNode: _editorFocus,
+            expands: true,
+            wrap: false,
+            background: Theme.of(context).colorScheme.surface,
+            cursorColor: const Color(0xff1f6feb),
+            textStyle: const TextStyle(
+              fontFamily: 'Consolas',
+              fontSize: 13,
+              height: 1.45,
+            ),
+            padding: const EdgeInsets.fromLTRB(10, 10, 12, 36),
           ),
         ),
-        Divider(height: 1, color: Theme.of(context).dividerColor),
-        Container(
-          height: 40,
-          padding: const EdgeInsets.symmetric(horizontal: 8),
-          color: Theme.of(context).colorScheme.surfaceContainer,
-          child: Row(
-            children: [
-              const Icon(Icons.table_rows_outlined, size: 17),
-              const SizedBox(width: 6),
-              const Text('Data', style: TextStyle(fontSize: 12)),
-              const Spacer(),
-              if (_results.length > 1)
-                DropdownButton<int>(
-                  value: _activeResult,
-                  underline: const SizedBox.shrink(),
-                  items: [
-                    for (var index = 0; index < _results.length; index++)
-                      DropdownMenuItem(
-                        value: index,
-                        child: Text('Result ${index + 1}'),
-                      ),
-                  ],
-                  onChanged: (value) {
-                    if (value != null) _selectResult(value);
-                  },
-                ),
-              PopupMenuButton<String>(
-                tooltip: 'Export result',
-                enabled: _columns.isNotEmpty,
-                onSelected: (value) => unawaited(_export(value)),
-                itemBuilder: (context) => const [
-                  PopupMenuItem(value: 'csv', child: Text('Export CSV')),
-                  PopupMenuItem(value: 'json', child: Text('Export JSON')),
-                ],
-                icon: const Icon(Icons.download_outlined, size: 18),
-              ),
+      ),
+      resultHeader: WorkbenchResultBar(
+        leading: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.table_rows_outlined, size: 17),
+            SizedBox(width: 6),
+            Text('Data', style: TextStyle(fontSize: 12)),
+          ],
+        ),
+        actions: [
+          if (_results.length > 1)
+            DropdownButton<int>(
+              value: _activeResult,
+              underline: const SizedBox.shrink(),
+              items: [
+                for (var index = 0; index < _results.length; index++)
+                  DropdownMenuItem(
+                    value: index,
+                    child: Text('Result ${index + 1}'),
+                  ),
+              ],
+              onChanged: (value) {
+                if (value != null) _selectResult(value);
+              },
+            ),
+          PopupMenuButton<String>(
+            tooltip: 'Export result',
+            enabled: _columns.isNotEmpty,
+            onSelected: (value) => unawaited(_export(value)),
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: 'csv', child: Text('Export CSV')),
+              PopupMenuItem(value: 'json', child: Text('Export JSON')),
             ],
+            icon: const Icon(Icons.download_outlined, size: 18),
           ),
-        ),
-        Expanded(child: _buildResultGrid()),
-      ],
-    );
-  }
-
-  Widget _buildResultGrid() {
-    return ResultGrid(
-      columns: _columns,
-      rows: _rows,
-      renderer: ResultGridRenderer.queryDock,
+        ],
+        countText: '${_rows.length} rows',
+      ),
+      resultContent: ResultGrid(
+        columns: _columns,
+        rows: _rows,
+        renderer: ResultGridRenderer.queryDock,
+      ),
     );
   }
 }

@@ -92,6 +92,40 @@ class SqliteDialect implements DatabaseDialect {
   }
 }
 
+class Db2Dialect implements DatabaseDialect {
+  const Db2Dialect();
+
+  @override
+  String quoteIdentifier(String value) => '"${value.replaceAll('"', '""')}"';
+
+  @override
+  String qualifiedTable(String schema, String table) =>
+      '${quoteIdentifier(schema)}.${quoteIdentifier(table)}';
+
+  @override
+  String tableDataSql(
+    String schema,
+    String table, {
+    required int limit,
+    required int offset,
+    String? orderBy,
+    bool ascending = true,
+    List<String> filters = const [],
+  }) {
+    final buffer = StringBuffer(
+      'SELECT * FROM ${qualifiedTable(schema, table)}',
+    );
+    if (filters.isNotEmpty) {
+      buffer.write(' WHERE ${filters.join(' AND ')}');
+    }
+    if (orderBy != null && orderBy.isNotEmpty) {
+      buffer.write(' ORDER BY $orderBy ${ascending ? 'ASC' : 'DESC'}');
+    }
+    buffer.write(' OFFSET $offset ROWS FETCH NEXT $limit ROWS ONLY;');
+    return buffer.toString();
+  }
+}
+
 String _selectSql(
   String table, {
   required int limit,

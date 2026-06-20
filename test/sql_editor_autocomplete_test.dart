@@ -166,7 +166,7 @@ void main() {
       tester
           .widget<Text>(
             find.text(
-              'Add a PostgreSQL, MySQL, or SQLite connection to begin.',
+              'Add a PostgreSQL, MySQL, DB2, or SQLite connection to begin.',
             ),
           )
           .style
@@ -296,6 +296,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('PostgreSQL'), findsOneWidget);
     expect(find.text('SQLite'), findsOneWidget);
+    expect(find.text('IBM Db2'), findsOneWidget);
 
     await tester.tap(find.text('SQLite'));
     await tester.pumpAndSettle();

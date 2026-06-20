@@ -20,13 +20,16 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../services/theme_controller.dart';
 import '../ai/services/openai_assistant.dart';
 import '../database/contracts/database_driver.dart';
+import '../database/drivers/db2_driver.dart';
 import '../database/drivers/mysql_driver.dart';
 import '../database/drivers/postgres_driver.dart';
 import '../database/models/database_schema.dart';
 import '../database/models/workbench_connection.dart';
+import '../database/services/db2_database.dart';
 import '../database/services/postgres_database.dart';
 import '../database/services/result_indexer.dart';
 import '../database/services/mysql_database.dart';
+import 'dialogs/db2_connection_dialog.dart';
 import 'dialogs/mysql_connection_dialog.dart';
 import 'models/open_database_connection.dart';
 import 'sqlite_workbench_page.dart';
@@ -35,6 +38,7 @@ import 'services/sql_autocomplete.dart';
 import 'services/workbench_services.dart';
 import 'widgets/db_viewer_widgets.dart';
 import 'widgets/database_connection_tree_tile.dart';
+import 'widgets/workbench_center.dart';
 
 class MyHomePage extends StatefulWidget {
   final String title;
@@ -60,8 +64,10 @@ class _MyHomePageState extends State<MyHomePage> {
   final PostgresConnectionStore _connectionStore = PostgresConnectionStore();
   final MySqlConnectionStore _mySqlConnectionStore =
       const MySqlConnectionStore();
+  final Db2ConnectionStore _db2ConnectionStore = const Db2ConnectionStore();
   final PostgresDriver _postgresDriver = PostgresDriver();
   final MySqlDriver _mySqlDriver = const MySqlDriver();
+  final Db2Driver _db2Driver = const Db2Driver();
   final AiAssistantSettingsStore _aiSettingsStore =
       const AiAssistantSettingsStore();
   final AiAssistantClient _aiClient = AiAssistantClient();
@@ -76,6 +82,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
   PostgresDatabase? _database;
   _OpenMySqlConnection? _activeMySqlConnection;
+  _OpenDb2Connection? _activeDb2Connection;
   PostgresDatabase? _executingDatabase;
   bool _isExecuting = false;
   bool _cancelRequested = false;
@@ -120,6 +127,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
   final List<_OpenConnection> _connections = [];
   final List<_OpenMySqlConnection> _mySqlConnections = [];
+  final List<_OpenDb2Connection> _db2Connections = [];
   final List<_SqlScriptTab> _sqlTabs = [];
   final List<_OpenTableTab> _openTableTabs = [];
   final Set<String> _loadingSchemas = {};
@@ -146,6 +154,7 @@ class _MyHomePageState extends State<MyHomePage> {
     _initializeSqlEditor();
     _loadSavedConnections();
     _loadSavedMySqlConnections();
+    _loadSavedDb2Connections();
     _loadAiSettings();
     _loadResultGridRenderer();
     _loadSqlHistory();
@@ -164,6 +173,9 @@ class _MyHomePageState extends State<MyHomePage> {
     }
     for (final connection in _mySqlConnections) {
       unawaited(connection.database?.close() ?? Future<void>.value());
+    }
+    for (final connection in _db2Connections) {
+      unawaited(connection.session?.close() ?? Future<void>.value());
     }
     _activeResultTab.dispose();
     _aiPromptController.dispose();
@@ -200,6 +212,18 @@ class _MyHomePageState extends State<MyHomePage> {
         ..clear()
         ..addAll([
           for (final profile in profiles) _OpenMySqlConnection(config: profile),
+        ]);
+    });
+  }
+
+  Future<void> _loadSavedDb2Connections() async {
+    final profiles = await _db2ConnectionStore.load();
+    if (!mounted) return;
+    setState(() {
+      _db2Connections
+        ..clear()
+        ..addAll([
+          for (final profile in profiles) _OpenDb2Connection(config: profile),
         ]);
     });
   }
@@ -566,9 +590,11 @@ class _MyHomePageState extends State<MyHomePage> {
   String get _activeAiDatabaseEngine {
     final tab = _activeSqlTab;
     if (tab != null) {
+      if (_db2ConnectionForKey(tab.connectionKey) != null) return 'DB2';
       if (_mySqlConnectionForKey(tab.connectionKey) != null) return 'MySQL';
       if (_connectionForKey(tab.connectionKey) != null) return 'PostgreSQL';
     }
+    if (_activeDb2Connection?.session != null) return 'DB2';
     if (_activeMySqlConnection?.database != null) return 'MySQL';
     if (_sqliteWorkbenchActive) return 'SQLite';
     if (_database != null) return 'PostgreSQL';
@@ -708,10 +734,47 @@ class _MyHomePageState extends State<MyHomePage> {
               subtitle: Text('MySQL or MariaDB server'),
             ),
           ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, 'db2'),
+            child: const ListTile(
+              leading: Icon(Icons.dns_outlined),
+              title: Text('IBM Db2'),
+              subtitle: Text('Db2 through local Go backend'),
+            ),
+          ),
         ],
       ),
     );
     if (!mounted || engine == null) return;
+    if (engine == 'db2') {
+      final config = await showDialog<Db2ConnectionConfig>(
+        context: context,
+        builder: (context) => const Db2ConnectionDialog(),
+      );
+      if (config == null) return;
+      await _db2ConnectionStore.save(config);
+      if (!mounted) return;
+      setState(() {
+        final existing = _db2Connections.indexWhere(
+          (connection) => connection.config.endpointName == config.endpointName,
+        );
+        if (existing == -1) {
+          _db2Connections.insert(0, _OpenDb2Connection(config: config));
+        } else {
+          _db2Connections[existing].config = config;
+          _db2Connections[existing].connectionError = null;
+        }
+        _activeConnection = config.displayName;
+        _activeSchema = '-';
+        _activeDriver = 'db2';
+        _status = 'Disconnected';
+        _logs.add(
+          '[INFO] Saved DB2 profile: ${config.displayName}. Expand it to connect.',
+        );
+      });
+      _showResultTab('Messages');
+      return;
+    }
     if (engine == 'mysql') {
       final config = await showDialog<MySqlConnectionConfig>(
         context: context,
@@ -953,7 +1016,8 @@ class _MyHomePageState extends State<MyHomePage> {
         connection.isConnecting = false;
         _isConnecting =
             _connections.any((item) => item.isConnecting) ||
-            _mySqlConnections.any((item) => item.isConnecting);
+            _mySqlConnections.any((item) => item.isConnecting) ||
+            _db2Connections.any((item) => item.isConnecting);
         _activeConnection = connection.config.displayName;
         _activeMySqlConnection = connection;
         _activeSchema = connection.config.database;
@@ -969,7 +1033,8 @@ class _MyHomePageState extends State<MyHomePage> {
         connection.connectionError = error.toString();
         _isConnecting =
             _connections.any((item) => item.isConnecting) ||
-            _mySqlConnections.any((item) => item.isConnecting);
+            _mySqlConnections.any((item) => item.isConnecting) ||
+            _db2Connections.any((item) => item.isConnecting);
         _status = 'Connection failed';
         _logs.add('[ERROR] MySQL connection failed: $error');
       });
@@ -981,6 +1046,7 @@ class _MyHomePageState extends State<MyHomePage> {
   void _activateMySqlConnection(_OpenMySqlConnection connection) {
     setState(() {
       _activeMySqlConnection = connection;
+      _activeDb2Connection = null;
       _sessions = const [];
       _activeConnection = connection.config.displayName;
       _activeSchema = connection.config.database;
@@ -993,6 +1059,175 @@ class _MyHomePageState extends State<MyHomePage> {
     if (_rightPanelMode == 'sessions') {
       unawaited(_refreshSessions());
     }
+  }
+
+  Future<void> _editDb2Connection(_OpenDb2Connection connection) async {
+    final previous = connection.config;
+    final config = await showDialog<Db2ConnectionConfig>(
+      context: context,
+      builder: (context) => Db2ConnectionDialog(initial: previous),
+    );
+    if (config == null) return;
+    if (config.endpointName != previous.endpointName) {
+      await _db2ConnectionStore.delete(previous);
+    }
+    await _db2ConnectionStore.save(config);
+    await _invalidateDb2Connection(connection, quiet: true);
+    if (!mounted) return;
+    setState(() {
+      for (final tab in _sqlTabs) {
+        if (tab.connectionKey == _db2ConnectionKey(previous)) {
+          tab.connectionKey = _db2ConnectionKey(config);
+        }
+      }
+      connection.config = config;
+      connection.connectionError = null;
+      _logs.add('[INFO] Updated DB2 profile: ${config.displayName}');
+    });
+  }
+
+  Future<void> _deleteDb2Connection(_OpenDb2Connection connection) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete DB2 Connection'),
+        content: Text('Delete ${connection.config.displayName}?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await _invalidateDb2Connection(connection, quiet: true);
+    await _db2ConnectionStore.delete(connection.config);
+    if (!mounted) return;
+    setState(() {
+      _db2Connections.remove(connection);
+      _logs.add('[INFO] Deleted DB2 profile: ${connection.config.displayName}');
+    });
+  }
+
+  Future<void> _invalidateDb2Connection(
+    _OpenDb2Connection connection, {
+    bool quiet = false,
+  }) async {
+    await connection.session?.close();
+    if (!mounted) return;
+    setState(() {
+      final removed = _openTableTabs.where(
+        (tab) =>
+            tab.profile.engine == DatabaseEngine.db2 &&
+            tab.profile.id == connection.config.id,
+      );
+      for (final tab in removed) {
+        tab.dispose();
+      }
+      _openTableTabs.removeWhere(
+        (tab) =>
+            tab.profile.engine == DatabaseEngine.db2 &&
+            tab.profile.id == connection.config.id,
+      );
+      connection.session = null;
+      connection.database = null;
+      connection.schemas = const [];
+      connection.connectionError = null;
+      connection.isConnecting = false;
+      if (identical(_activeDb2Connection, connection)) {
+        _activeDb2Connection = null;
+      }
+      if (!quiet) {
+        _logs.add(
+          '[INFO] Invalidated DB2 connection: ${connection.config.displayName}',
+        );
+      }
+      final totalTabs = _sqlTabs.length + _openTableTabs.length;
+      if (totalTabs == 0) {
+        _activeCenterTab = 0;
+      } else if (_activeCenterTab >= totalTabs) {
+        _activeCenterTab = totalTabs - 1;
+      }
+    });
+  }
+
+  Future<bool> _ensureDb2Connection(_OpenDb2Connection connection) async {
+    if (connection.session != null) {
+      _activateDb2Connection(connection);
+      return true;
+    }
+    if (connection.isConnecting) return false;
+    setState(() {
+      connection.isConnecting = true;
+      connection.connectionError = null;
+      _isConnecting = true;
+      _status = 'Connecting';
+      _activeConnection = connection.config.displayName;
+      _activeDb2Connection = connection;
+      _activeMySqlConnection = null;
+    });
+    try {
+      final session = await _db2Driver.connect(connection.config) as Db2Session;
+      final schemas = await session.loadSchemas();
+      if (!mounted) {
+        await session.close();
+        return false;
+      }
+      setState(() {
+        connection.database = session.database;
+        connection.session = session;
+        connection.schemas = schemas;
+        connection.isConnecting = false;
+        _isConnecting =
+            _connections.any((item) => item.isConnecting) ||
+            _mySqlConnections.any((item) => item.isConnecting) ||
+            _db2Connections.any((item) => item.isConnecting);
+        _activeDb2Connection = connection;
+        _activeMySqlConnection = null;
+        _activeConnection = connection.config.displayName;
+        _activeSchema = schemas.isEmpty ? '-' : schemas.first.name;
+        _activeDriver = 'db2 via Go';
+        _status = 'Connected';
+        _logs.add('[INFO] Connected to DB2 ${connection.config.database}');
+      });
+      return true;
+    } catch (error) {
+      if (!mounted) return false;
+      setState(() {
+        connection.isConnecting = false;
+        connection.connectionError = error.toString();
+        _isConnecting =
+            _connections.any((item) => item.isConnecting) ||
+            _mySqlConnections.any((item) => item.isConnecting) ||
+            _db2Connections.any((item) => item.isConnecting);
+        _status = 'Connection failed';
+        _logs.add('[ERROR] DB2 connection failed: $error');
+      });
+      _showResultTab('Messages');
+      return false;
+    }
+  }
+
+  void _activateDb2Connection(_OpenDb2Connection connection) {
+    setState(() {
+      _activeDb2Connection = connection;
+      _activeMySqlConnection = null;
+      _sessions = const [];
+      _activeConnection = connection.config.displayName;
+      _activeSchema = connection.schemas.isEmpty
+          ? '-'
+          : connection.schemas.first.name;
+      _activeDriver = 'db2 via Go';
+      _status = connection.session == null ? 'Disconnected' : 'Connected';
+      _logs.add(
+        '[INFO] Activated DB2 connection: ${connection.config.displayName}',
+      );
+    });
   }
 
   Future<void> _deleteConnection(_OpenConnection connection) async {
@@ -1101,7 +1336,10 @@ class _MyHomePageState extends State<MyHomePage> {
         _activeDriver = 'postgres ${connection.config.sslMode.name}';
         _status = 'Disconnected';
       }
-      _isConnecting = _connections.any((item) => item.isConnecting);
+      _isConnecting =
+          _connections.any((item) => item.isConnecting) ||
+          _mySqlConnections.any((item) => item.isConnecting) ||
+          _db2Connections.any((item) => item.isConnecting);
       if (!quiet) {
         _logs.add(
           '[INFO] Invalidated connection: ${connection.config.displayName}',
@@ -1159,7 +1397,10 @@ class _MyHomePageState extends State<MyHomePage> {
         connection.database = database;
         connection.schemas = List<DatabaseSchema>.of(schemas);
         connection.isConnecting = false;
-        _isConnecting = _connections.any((item) => item.isConnecting);
+        _isConnecting =
+            _connections.any((item) => item.isConnecting) ||
+            _mySqlConnections.any((item) => item.isConnecting) ||
+            _db2Connections.any((item) => item.isConnecting);
         _database = database;
         _activeConnection = connection.config.displayName;
         _activeSchema = schemas.isEmpty ? '-' : schemas.first.name;
@@ -1178,7 +1419,10 @@ class _MyHomePageState extends State<MyHomePage> {
       setState(() {
         connection.isConnecting = false;
         connection.connectionError = error.toString();
-        _isConnecting = _connections.any((item) => item.isConnecting);
+        _isConnecting =
+            _connections.any((item) => item.isConnecting) ||
+            _mySqlConnections.any((item) => item.isConnecting) ||
+            _db2Connections.any((item) => item.isConnecting);
         if (_database == null) {
           _status = 'Connection failed';
           _activeSchema = '-';
@@ -1192,6 +1436,22 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Future<void> _executeSql() async {
     final tab = _activeSqlTab;
+    final db2Connection = tab == null
+        ? null
+        : _db2ConnectionForKey(tab.connectionKey);
+    if (db2Connection != null) {
+      if (!await _ensureDb2Connection(db2Connection)) return;
+      final execution = _sqlToExecute();
+      await _runSharedSessionSql(
+        execution.sql,
+        db2Connection.session!,
+        engineName: 'DB2',
+        loadingOperation: 'Executing DB2 SQL...',
+        editorText: tab?.controller.text,
+        editorOffset: execution.offset,
+      );
+      return;
+    }
     final mySqlConnection = tab == null
         ? null
         : _mySqlConnectionForKey(tab.connectionKey);
@@ -1227,6 +1487,24 @@ class _MyHomePageState extends State<MyHomePage> {
     MySqlSession session, {
     String? editorText,
     int editorOffset = 0,
+  }) {
+    return _runSharedSessionSql(
+      sql,
+      session,
+      engineName: 'MySQL',
+      loadingOperation: 'Executing MySQL SQL...',
+      editorText: editorText,
+      editorOffset: editorOffset,
+    );
+  }
+
+  Future<void> _runSharedSessionSql(
+    String sql,
+    DatabaseSession session, {
+    required String engineName,
+    required String loadingOperation,
+    String? editorText,
+    int editorOffset = 0,
   }) async {
     if (sql.trim().isEmpty) return;
     if (session.profile.writeProtected &&
@@ -1245,10 +1523,10 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _isExecuting = true;
       _cancelRequested = false;
-      _loadingOperation = 'Executing MySQL SQL...';
+      _loadingOperation = loadingOperation;
       _activeSqlTab?.error = null;
       _clearSqlResultState();
-      _logs.add('[INFO] Executing MySQL SQL...');
+      _logs.add('[INFO] Executing $engineName SQL...');
     });
     try {
       final run = await _queryRunner.execute(session, sql);
@@ -1271,7 +1549,7 @@ class _MyHomePageState extends State<MyHomePage> {
         _isExecuting = false;
         _loadingOperation = null;
         _logs.add(
-          '[INFO] MySQL query completed: ${result.rowCount} rows, '
+          '[INFO] $engineName query completed: ${result.rowCount} rows, '
           '${result.affectedRows} affected',
         );
       });
@@ -1300,7 +1578,7 @@ class _MyHomePageState extends State<MyHomePage> {
           editorOffset + 1,
           error.toString(),
         );
-        _logs.add('[ERROR] MySQL query failed: $error');
+        _logs.add('[ERROR] $engineName query failed: $error');
       });
       unawaited(
         _recordSqlHistory(
@@ -1829,9 +2107,22 @@ class _MyHomePageState extends State<MyHomePage> {
     return 'mysql:${config.endpointName}';
   }
 
+  String _db2ConnectionKey(Db2ConnectionConfig config) {
+    return 'db2:${config.endpointName}';
+  }
+
   _OpenMySqlConnection? _mySqlConnectionForKey(String connectionKey) {
     for (final connection in _mySqlConnections) {
       if (connectionKey == _mySqlConnectionKey(connection.config)) {
+        return connection;
+      }
+    }
+    return null;
+  }
+
+  _OpenDb2Connection? _db2ConnectionForKey(String connectionKey) {
+    for (final connection in _db2Connections) {
+      if (connectionKey == _db2ConnectionKey(connection.config)) {
         return connection;
       }
     }
@@ -1873,6 +2164,8 @@ class _MyHomePageState extends State<MyHomePage> {
     }
     final mySql = _mySqlConnectionForKey(connectionKey);
     if (mySql != null) return '${mySql.config.displayName} (MySQL)';
+    final db2 = _db2ConnectionForKey(connectionKey);
+    if (db2 != null) return '${db2.config.displayName} (DB2)';
     return _connectionForKey(connectionKey)?.config.displayName ??
         connectionKey;
   }
@@ -1889,10 +2182,10 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _setAutoCommit(bool enabled) async {
-    final database = _currentDatabase;
-    if (database == null) return;
+    final session = _activeDatabaseSession;
+    if (session == null) return;
     try {
-      await database.setAutoCommit(enabled);
+      await session.setAutoCommit(enabled);
       if (!mounted) return;
       setState(() {
         _logs.add(
@@ -1907,17 +2200,17 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _commitTransaction() async {
-    final database = _currentDatabase;
-    if (database == null) return;
-    await database.commit();
+    final session = _activeDatabaseSession;
+    if (session == null) return;
+    await session.commit();
     if (!mounted) return;
     setState(() => _logs.add('[INFO] Transaction committed'));
   }
 
   Future<void> _rollbackTransaction() async {
-    final database = _currentDatabase;
-    if (database == null) return;
-    await database.rollback();
+    final session = _activeDatabaseSession;
+    if (session == null) return;
+    await session.rollback();
     if (!mounted) return;
     setState(() => _logs.add('[INFO] Transaction rolled back'));
   }
@@ -2627,6 +2920,44 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  Future<void> _loadDb2SchemaTables(
+    _OpenDb2Connection connection,
+    String schema,
+  ) async {
+    if (!await _ensureDb2Connection(connection)) return;
+    final loadingKey = '${connection.config.endpointName}.$schema';
+    if (!_loadingSchemas.add(loadingKey)) return;
+    setState(() {});
+    try {
+      final tables = await connection.session!.loadTables(schema);
+      if (!mounted) return;
+      setState(() {
+        final index = connection.schemas.indexWhere(
+          (item) => item.name == schema,
+        );
+        if (index >= 0) {
+          connection.schemas[index] = connection.schemas[index].copyWith(
+            tables: tables,
+            tablesLoaded: true,
+          );
+        }
+        _logs.add('[INFO] Loaded ${tables.length} DB2 tables for $schema');
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _logs.add('[ERROR] Failed to load DB2 tables for $schema: $error');
+      });
+      _showResultTab('Messages');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingSchemas.remove(loadingKey);
+        });
+      }
+    }
+  }
+
   Future<void> _openTableData(
     String schema,
     DatabaseTable table, {
@@ -2724,6 +3055,70 @@ class _MyHomePageState extends State<MyHomePage> {
         '[INFO] Opened MySQL data browser: '
         '${connection.config.database}.${table.name}',
       );
+    });
+    if (existingIndex == -1) _revealLastCenterTab();
+    await _loadTableTabData(tab);
+  }
+
+  Future<void> _openDb2TableData(
+    _OpenDb2Connection connection,
+    String schema,
+    DatabaseTable table, {
+    String initialTab = 'Data',
+  }) async {
+    if (!await _ensureDb2Connection(connection)) return;
+    var metadata = table;
+    if (!metadata.columnsLoaded) {
+      metadata = await connection.session!.loadTable(schema, table.name);
+      if (!mounted) return;
+      setState(() {
+        final schemaIndex = connection.schemas.indexWhere(
+          (item) => item.name == schema,
+        );
+        if (schemaIndex >= 0) {
+          final schemaModel = connection.schemas[schemaIndex];
+          final tables = List<DatabaseTable>.of(schemaModel.tables);
+          final tableIndex = tables.indexWhere(
+            (item) => item.name == table.name,
+          );
+          if (tableIndex >= 0) tables[tableIndex] = metadata;
+          connection.schemas[schemaIndex] = schemaModel.copyWith(
+            tables: tables,
+            tablesLoaded: true,
+          );
+        }
+      });
+    }
+    final existingIndex = _openTableTabs.indexWhere(
+      (tab) =>
+          tab.profile.engine == DatabaseEngine.db2 &&
+          tab.profile.id == connection.config.id &&
+          tab.schema == schema &&
+          tab.table == table.name,
+    );
+    late final _OpenTableTab tab;
+    setState(() {
+      _sqliteWorkbenchActive = false;
+      if (existingIndex == -1) {
+        tab = _OpenTableTab(
+          session: connection.session!,
+          schema: schema,
+          metadata: metadata,
+        );
+        _openTableTabs.add(tab);
+        _activeCenterTab = _tableTabOffset + _openTableTabs.length - 1;
+      } else {
+        tab = _openTableTabs[existingIndex];
+        _activeCenterTab = _tableTabOffset + existingIndex;
+      }
+      tab.innerTab = initialTab;
+      _activeDb2Connection = connection;
+      _activeMySqlConnection = null;
+      _activeConnection = connection.config.displayName;
+      _activeSchema = schema;
+      _activeDriver = 'db2 via Go';
+      _status = 'Connected';
+      _logs.add('[INFO] Opened DB2 data browser: $schema.${table.name}');
     });
     if (existingIndex == -1) _revealLastCenterTab();
     await _loadTableTabData(tab);
@@ -3211,6 +3606,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
     setState(() {
       _activeMySqlConnection = null;
+      _activeDb2Connection = null;
       _sessions = const [];
       _database = database;
       _activeConnection = database.config.displayName;
@@ -3256,23 +3652,31 @@ class _MyHomePageState extends State<MyHomePage> {
         ? value.selection.baseOffset
         : value.text.length;
     final connection = _connectionForKey(tab.connectionKey);
+    final associatedDb2Connection = _db2ConnectionForKey(tab.connectionKey);
     final associatedMySqlConnection = _mySqlConnectionForKey(tab.connectionKey);
+    final db2Connection =
+        associatedDb2Connection ??
+        (tab.connectionKey == _globalScriptConnectionKey
+            ? _activeDb2Connection
+            : null);
     final mySqlConnection =
         associatedMySqlConnection ??
         (tab.connectionKey == _globalScriptConnectionKey
             ? _activeMySqlConnection
             : null);
-    final schemas = mySqlConnection == null
-        ? connection?.schemas ??
-              _activeOpenConnection?.schemas ??
-              const <DatabaseSchema>[]
-        : [
+    final schemas = db2Connection != null
+        ? db2Connection.schemas
+        : mySqlConnection != null
+        ? [
             DatabaseSchema(
               name: mySqlConnection.config.database,
               tables: mySqlConnection.tables,
               tablesLoaded: true,
             ),
-          ];
+          ]
+        : connection?.schemas ??
+              _activeOpenConnection?.schemas ??
+              const <DatabaseSchema>[];
     final result = _autocompleteEngine.build(
       sql: value.text,
       cursor: cursor,
@@ -3285,8 +3689,16 @@ class _MyHomePageState extends State<MyHomePage> {
         request!.schema,
         request.table!,
         connection: connection,
+        db2Connection: db2Connection,
         mySqlConnection: mySqlConnection,
       );
+    } else if (request?.schema != null && db2Connection != null) {
+      final schema = schemas
+          .where((item) => item.name == request!.schema)
+          .firstOrNull;
+      if (schema != null) {
+        _loadAutocompleteDb2SchemaTables(db2Connection, schema, tab);
+      }
     } else if (request?.schema != null && connection != null) {
       final schema = schemas
           .where((item) => item.name == request!.schema)
@@ -3318,9 +3730,13 @@ class _MyHomePageState extends State<MyHomePage> {
     String? schema,
     DatabaseTable table, {
     _OpenConnection? connection,
+    _OpenDb2Connection? db2Connection,
     _OpenMySqlConnection? mySqlConnection,
   }) {
-    final engineKey = mySqlConnection?.config.id ?? connection?.config.id;
+    final engineKey =
+        db2Connection?.config.id ??
+        mySqlConnection?.config.id ??
+        connection?.config.id;
     if (engineKey == null) return;
     final key = '$engineKey.${schema ?? ''}.${table.name}';
     if (!_autocompleteSchemaLoads.add(key)) return;
@@ -3341,6 +3757,28 @@ class _MyHomePageState extends State<MyHomePage> {
           if (index >= 0) {
             mySqlConnection.tables[index] = loaded;
           }
+        } else if (db2Connection != null && schema != null) {
+          final session = db2Connection.session;
+          if (session == null) return;
+          final loaded = await session.loadTable(schema, table.name);
+          if (!mounted) return;
+          final schemaIndex = db2Connection.schemas.indexWhere(
+            (item) => item.name == schema,
+          );
+          if (schemaIndex >= 0) {
+            final schemaModel = db2Connection.schemas[schemaIndex];
+            final tables = List<DatabaseTable>.of(schemaModel.tables);
+            final tableIndex = tables.indexWhere(
+              (item) => item.name.toLowerCase() == loaded.name.toLowerCase(),
+            );
+            if (tableIndex >= 0) {
+              tables[tableIndex] = loaded;
+              db2Connection.schemas[schemaIndex] = schemaModel.copyWith(
+                tables: tables,
+                tablesLoaded: true,
+              );
+            }
+          }
         } else if (connection != null && schema != null) {
           await _loadTableColumnsForConnection(connection, schema, table);
         }
@@ -3353,6 +3791,21 @@ class _MyHomePageState extends State<MyHomePage> {
     unawaited(load());
   }
 
+  void _loadAutocompleteDb2SchemaTables(
+    _OpenDb2Connection connection,
+    DatabaseSchema schema,
+    _SqlScriptTab tab,
+  ) {
+    final key = '${connection.config.endpointName}.${schema.name}';
+    if (!_autocompleteSchemaLoads.add(key)) return;
+    unawaited(
+      _loadDb2SchemaTables(connection, schema.name).whenComplete(() {
+        _autocompleteSchemaLoads.remove(key);
+        if (mounted) tab.controller.refreshCompletions();
+      }),
+    );
+  }
+
   void _insertAutocompleteOption(_SqlCompletion option) {
     final sqlTab = _activeSqlTab;
     if (sqlTab == null) return;
@@ -3363,6 +3816,28 @@ class _MyHomePageState extends State<MyHomePage> {
     );
 
     if (option.schema != null && option.table != null) {
+      final db2Connection = _db2ConnectionForKey(sqlTab.connectionKey);
+      final effectiveDb2Connection =
+          db2Connection ??
+          (sqlTab.connectionKey == _globalScriptConnectionKey
+              ? _activeDb2Connection
+              : null);
+      if (effectiveDb2Connection != null) {
+        final table = effectiveDb2Connection.schemas
+            .where((schema) => schema.name == option.schema)
+            .expand((schema) => schema.tables)
+            .where((table) => table.name == option.table)
+            .firstOrNull;
+        if (table != null && !table.columnsLoaded) {
+          _loadAutocompleteTableColumns(
+            sqlTab,
+            option.schema,
+            table,
+            db2Connection: effectiveDb2Connection,
+          );
+        }
+        return;
+      }
       final mySqlConnection = _mySqlConnectionForKey(sqlTab.connectionKey);
       final effectiveMySqlConnection =
           mySqlConnection ??
@@ -3559,10 +4034,16 @@ class _MyHomePageState extends State<MyHomePage> {
       return _activeMySqlConnection!.session;
     }
 
+    if (_activeDb2Connection?.session != null) {
+      return _activeDb2Connection!.session;
+    }
+
     final sqlTab = _activeSqlTab;
     if (sqlTab != null) {
       final mysql = _mySqlConnectionForKey(sqlTab.connectionKey);
       if (mysql?.session != null) return mysql!.session;
+      final db2 = _db2ConnectionForKey(sqlTab.connectionKey);
+      if (db2?.session != null) return db2!.session;
       final postgres = _connectionForKey(sqlTab.connectionKey)?.database;
       if (postgres != null) {
         return PostgresSession(
@@ -3585,6 +4066,8 @@ class _MyHomePageState extends State<MyHomePage> {
   int get _tableTabOffset => _sqlTabs.length;
 
   String get _activeScriptConnectionKey {
+    final db2 = _activeDb2Connection;
+    if (db2 != null) return _db2ConnectionKey(db2.config);
     final mySql = _activeMySqlConnection;
     if (mySql != null) return _mySqlConnectionKey(mySql.config);
     final database = _database;
@@ -4103,6 +4586,17 @@ class _MyHomePageState extends State<MyHomePage> {
                 right.config.displayName.toLowerCase(),
               );
       });
+    final db2Connections = List<_OpenDb2Connection>.of(_db2Connections)
+      ..sort((left, right) {
+        final folder = left.config.folder.toLowerCase().compareTo(
+          right.config.folder.toLowerCase(),
+        );
+        return folder != 0
+            ? folder
+            : left.config.displayName.toLowerCase().compareTo(
+                right.config.displayName.toLowerCase(),
+              );
+      });
     return Container(
       color: Theme.of(context).colorScheme.surface,
       child: Column(
@@ -4120,11 +4614,13 @@ class _MyHomePageState extends State<MyHomePage> {
           Expanded(
             child: ListView(
               children: [
-                if (_connections.isEmpty && _mySqlConnections.isEmpty)
+                if (_connections.isEmpty &&
+                    _mySqlConnections.isEmpty &&
+                    _db2Connections.isEmpty)
                   Padding(
                     padding: const EdgeInsets.all(12),
                     child: Text(
-                      'Add a PostgreSQL, MySQL, or SQLite connection to begin.',
+                      'Add a PostgreSQL, MySQL, DB2, or SQLite connection to begin.',
                       style: TextStyle(
                         fontSize: 12,
                         color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -4377,6 +4873,106 @@ class _MyHomePageState extends State<MyHomePage> {
                       );
                     },
                   ),
+                if (db2Connections.isNotEmpty)
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(12, 12, 8, 4),
+                    child: Text(
+                      'DB2',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                for (final connection in db2Connections)
+                  _Db2ConnectionTreeItem(
+                    connection: connection,
+                    active:
+                        connection.session != null &&
+                        identical(_activeDb2Connection, connection),
+                    loadingSchemas: _loadingSchemas,
+                    loadingTables: _loadingTables,
+                    onExpand: () => _ensureDb2Connection(connection),
+                    onActivate: () {
+                      if (connection.session == null) {
+                        unawaited(_ensureDb2Connection(connection));
+                      } else {
+                        _activateDb2Connection(connection);
+                      }
+                    },
+                    onEdit: () => unawaited(_editDb2Connection(connection)),
+                    onDelete: () => unawaited(_deleteDb2Connection(connection)),
+                    onInvalidate: () =>
+                        unawaited(_invalidateDb2Connection(connection)),
+                    onLoadSchema: (schema) =>
+                        _loadDb2SchemaTables(connection, schema.name),
+                    onOpenTableData: (schema, table, initialTab) =>
+                        _openDb2TableData(
+                          connection,
+                          schema,
+                          table,
+                          initialTab: initialTab,
+                        ),
+                    onLoadTable: (schema, table) async {
+                      if (!await _ensureDb2Connection(connection)) return;
+                      if (table.columnsLoaded) return;
+                      final loaded = await connection.session!.loadTable(
+                        schema,
+                        table.name,
+                      );
+                      if (!mounted) return;
+                      setState(() {
+                        final schemaIndex = connection.schemas.indexWhere(
+                          (item) => item.name == schema,
+                        );
+                        if (schemaIndex < 0) return;
+                        final schemaModel = connection.schemas[schemaIndex];
+                        final tables = List<DatabaseTable>.of(
+                          schemaModel.tables,
+                        );
+                        final tableIndex = tables.indexWhere(
+                          (item) => item.name == table.name,
+                        );
+                        if (tableIndex >= 0) tables[tableIndex] = loaded;
+                        connection.schemas[schemaIndex] = schemaModel.copyWith(
+                          tables: tables,
+                          tablesLoaded: true,
+                        );
+                      });
+                    },
+                    onAttachTable: (schema, table) async {
+                      if (!await _ensureDb2Connection(connection)) return;
+                      var loaded = table;
+                      if (!loaded.columnsLoaded) {
+                        loaded = await connection.session!.loadTable(
+                          schema,
+                          table.name,
+                        );
+                      }
+                      final buffer = StringBuffer()
+                        ..writeln(
+                          'Connection: ${connection.config.displayName}',
+                        )
+                        ..writeln('DB2 database: ${connection.config.database}')
+                        ..writeln('Schema: $schema')
+                        ..writeln('Table: ${loaded.name}')
+                        ..writeln('Columns:');
+                      for (final column in loaded.columns) {
+                        buffer.writeln(
+                          '- ${column.name}: ${column.dataType}'
+                          '${column.primaryKey ? ' PRIMARY KEY' : ''}',
+                        );
+                      }
+                      _addAiAttachment(
+                        _AiAttachment(
+                          id: 'db2-table:${connection.config.endpointName}:$schema.${loaded.name}',
+                          label: '$schema.${loaded.name}',
+                          icon: Icons.table_chart_outlined,
+                          content: buffer.toString(),
+                        ),
+                      );
+                    },
+                  ),
               ],
             ),
           ),
@@ -4435,71 +5031,13 @@ class _MyHomePageState extends State<MyHomePage> {
     }
 
     return _withLoadingOverlay(
-      Column(
-        children: [
-          _buildCenterTabs(),
-          Expanded(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final maxResultHeight = (constraints.maxHeight - 140).clamp(
-                  0.0,
-                  constraints.maxHeight,
-                );
-                final minResultHeight = maxResultHeight < 120
-                    ? maxResultHeight
-                    : 120.0;
-                final resultHeight = _resultPanelHeight.clamp(
-                  minResultHeight,
-                  maxResultHeight,
-                );
-                return Column(
-                  children: [
-                    Expanded(child: _buildSqlEditorSurface(sqlTab)),
-                    MouseRegion(
-                      cursor: SystemMouseCursors.resizeRow,
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onVerticalDragUpdate: (details) {
-                          setState(() {
-                            _resultPanelHeight =
-                                (_resultPanelHeight - details.delta.dy).clamp(
-                                  minResultHeight,
-                                  maxResultHeight,
-                                );
-                          });
-                        },
-                        child: Container(
-                          height: 7,
-                          color: Theme.of(context).dividerColor,
-                          alignment: Alignment.center,
-                          child: Container(
-                            width: 36,
-                            height: 2,
-                            color: Theme.of(context).colorScheme.outline,
-                          ),
-                        ),
-                      ),
-                    ),
-                    SizedBox(
-                      height: resultHeight,
-                      child: Column(
-                        children: [
-                          _buildResultHeader(),
-                          Expanded(
-                            child: Container(
-                              color: Theme.of(context).colorScheme.surface,
-                              child: _buildResultContent(),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                );
-              },
-            ),
-          ),
-        ],
+      WorkbenchCenterScaffold(
+        tabBar: _buildCenterTabs(),
+        editor: _buildSqlEditorSurface(sqlTab),
+        resultHeader: _buildResultHeader(),
+        resultContent: _buildResultContent(),
+        initialResultHeight: _resultPanelHeight,
+        onResultHeightChanged: (height) => _resultPanelHeight = height,
       ),
     );
   }
@@ -4754,136 +5292,116 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Widget _buildSqlEditorSurface(_SqlScriptTab sqlTab) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
-        border: Border(
-          bottom: BorderSide(color: Theme.of(context).dividerColor),
-        ),
-      ),
-      child: Column(
-        children: [
-          Container(
-            height: 34,
-            padding: const EdgeInsets.symmetric(horizontal: 10),
-            decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.surfaceContainer,
-              border: Border(
-                bottom: BorderSide(color: Theme.of(context).dividerColor),
+    return WorkbenchEditorSurface(
+      toolbar: LayoutBuilder(
+        builder: (context, constraints) {
+          final compact = constraints.maxWidth < 440;
+          final connectionKeys = [
+            _globalScriptConnectionKey,
+            for (final connection in _connections)
+              connection.config.endpointName,
+            for (final connection in _mySqlConnections)
+              _mySqlConnectionKey(connection.config),
+            for (final connection in _db2Connections)
+              _db2ConnectionKey(connection.config),
+          ];
+          final selectedKey = connectionKeys.contains(sqlTab.connectionKey)
+              ? sqlTab.connectionKey
+              : _globalScriptConnectionKey;
+          final selectedLabel = _scriptConnectionLabel(selectedKey);
+          final choices = [
+            for (final connection in _connections)
+              _SqlConnectionChoice(
+                key: connection.config.endpointName,
+                label: connection.config.displayName,
+                engine: 'PostgreSQL',
               ),
-            ),
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final compact = constraints.maxWidth < 440;
-                final connectionKeys = [
-                  _globalScriptConnectionKey,
-                  for (final connection in _connections)
-                    connection.config.endpointName,
-                  for (final connection in _mySqlConnections)
-                    _mySqlConnectionKey(connection.config),
-                ];
-                final selectedKey =
-                    connectionKeys.contains(sqlTab.connectionKey)
-                    ? sqlTab.connectionKey
-                    : _globalScriptConnectionKey;
-                final selectedLabel = _scriptConnectionLabel(selectedKey);
-                final choices = [
-                  for (final connection in _connections)
-                    _SqlConnectionChoice(
-                      key: connection.config.endpointName,
-                      label: connection.config.displayName,
-                      engine: 'PostgreSQL',
-                    ),
-                  for (final connection in _mySqlConnections)
-                    _SqlConnectionChoice(
-                      key: _mySqlConnectionKey(connection.config),
-                      label: connection.config.displayName,
-                      engine: 'MySQL',
-                    ),
-                ];
+            for (final connection in _mySqlConnections)
+              _SqlConnectionChoice(
+                key: _mySqlConnectionKey(connection.config),
+                label: connection.config.displayName,
+                engine: 'MySQL',
+              ),
+            for (final connection in _db2Connections)
+              _SqlConnectionChoice(
+                key: _db2ConnectionKey(connection.config),
+                label: connection.config.displayName,
+                engine: 'DB2',
+              ),
+          ];
 
-                return Row(
-                  children: [
-                    if (!compact) ...[
-                      const Icon(
-                        Icons.terminal,
-                        size: 16,
-                        color: Colors.blueGrey,
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Connection:',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                    ],
-                    Expanded(
-                      child: _SqlConnectionSelector(
-                        compact: compact,
-                        value: selectedKey,
-                        label: selectedLabel,
-                        connections: choices,
-                        globalKey: _globalScriptConnectionKey,
-                        onChanged: (value) =>
-                            unawaited(_setSqlTabConnection(sqlTab, value)),
-                      ),
-                    ),
-                    if (!compact) const SizedBox(width: 6),
-                    IconButton(
-                      tooltip: 'Complete SQL with AI',
-                      onPressed: sqlTab.aiCompleting
-                          ? null
-                          : () => unawaited(_requestAiCompletion(sqlTab)),
-                      icon: sqlTab.aiCompleting
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.auto_awesome_outlined, size: 17),
-                      padding: EdgeInsets.zero,
-                      visualDensity: VisualDensity.compact,
-                    ),
-                    IconButton(
-                      tooltip: 'Save SQL',
-                      onPressed: () => unawaited(_saveSql()),
-                      icon: const Icon(Icons.save, size: 17),
-                      padding: EdgeInsets.zero,
-                      visualDensity: VisualDensity.compact,
-                    ),
-                    IconButton(
-                      tooltip: 'Execute SQL',
-                      onPressed: _isExecuting || _isConnecting
-                          ? null
-                          : _executeShortcut,
-                      icon: const Icon(Icons.play_arrow, size: 18),
-                      padding: EdgeInsets.zero,
-                      visualDensity: VisualDensity.compact,
-                    ),
-                  ],
-                );
-              },
-            ),
-          ),
-          Expanded(
-            child: _SqlCodeEditor(
-              controller: sqlTab.controller,
-              focusNode: sqlTab.focusNode,
-              error: sqlTab.error,
-              onDismissError: () => setState(() => sqlTab.error = null),
-              onExecute: _executeShortcut,
-              aiSuggestion: sqlTab.aiSuggestion,
-              onAcceptAiSuggestion: () => _acceptAiCompletion(sqlTab),
-              onDismissAiSuggestion: () =>
-                  setState(() => sqlTab.aiSuggestion = null),
-              optionsBuilder: (value) => _sqlAutocompleteOptions(sqlTab, value),
-              onSelected: _insertAutocompleteOption,
-            ),
-          ),
-        ],
+          return Row(
+            children: [
+              if (!compact) ...[
+                const Icon(Icons.terminal, size: 16, color: Colors.blueGrey),
+                const SizedBox(width: 8),
+                Text(
+                  'Connection:',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(width: 6),
+              ],
+              Expanded(
+                child: _SqlConnectionSelector(
+                  compact: compact,
+                  value: selectedKey,
+                  label: selectedLabel,
+                  connections: choices,
+                  globalKey: _globalScriptConnectionKey,
+                  onChanged: (value) =>
+                      unawaited(_setSqlTabConnection(sqlTab, value)),
+                ),
+              ),
+              if (!compact) const SizedBox(width: 6),
+              IconButton(
+                tooltip: 'Complete SQL with AI',
+                onPressed: sqlTab.aiCompleting
+                    ? null
+                    : () => unawaited(_requestAiCompletion(sqlTab)),
+                icon: sqlTab.aiCompleting
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.auto_awesome_outlined, size: 17),
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+              ),
+              IconButton(
+                tooltip: 'Save SQL',
+                onPressed: () => unawaited(_saveSql()),
+                icon: const Icon(Icons.save, size: 17),
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+              ),
+              IconButton(
+                tooltip: 'Execute SQL',
+                onPressed: _isExecuting || _isConnecting
+                    ? null
+                    : _executeShortcut,
+                icon: const Icon(Icons.play_arrow, size: 18),
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+              ),
+            ],
+          );
+        },
+      ),
+      editor: _SqlCodeEditor(
+        controller: sqlTab.controller,
+        focusNode: sqlTab.focusNode,
+        error: sqlTab.error,
+        onDismissError: () => setState(() => sqlTab.error = null),
+        onExecute: _executeShortcut,
+        aiSuggestion: sqlTab.aiSuggestion,
+        onAcceptAiSuggestion: () => _acceptAiCompletion(sqlTab),
+        onDismissAiSuggestion: () => setState(() => sqlTab.aiSuggestion = null),
+        optionsBuilder: (value) => _sqlAutocompleteOptions(sqlTab, value),
+        onSelected: _insertAutocompleteOption,
       ),
     );
   }
@@ -5316,6 +5834,7 @@ class _MyHomePageState extends State<MyHomePage> {
     final engineName = switch (engine) {
       DatabaseEngine.mysql => 'MySQL',
       DatabaseEngine.sqlite => 'SQLite',
+      DatabaseEngine.db2 => 'DB2',
       DatabaseEngine.postgresql => 'PostgreSQL',
       null => 'Database',
     };
@@ -6994,6 +7513,157 @@ class _SqlCodeEditorState extends State<_SqlCodeEditor> {
 }
 
 typedef _OpenMySqlConnection = OpenMySqlConnection;
+typedef _OpenDb2Connection = OpenDb2Connection;
+
+class _Db2ConnectionTreeItem extends StatelessWidget {
+  final _OpenDb2Connection connection;
+  final bool active;
+  final Set<String> loadingSchemas;
+  final Set<String> loadingTables;
+  final Future<bool> Function() onExpand;
+  final VoidCallback onActivate;
+  final VoidCallback onEdit;
+  final VoidCallback onDelete;
+  final VoidCallback onInvalidate;
+  final Future<void> Function(DatabaseSchema schema) onLoadSchema;
+  final Future<void> Function(String schema, DatabaseTable table) onLoadTable;
+  final Future<void> Function(
+    String schema,
+    DatabaseTable table,
+    String initialTab,
+  )
+  onOpenTableData;
+  final Future<void> Function(String schema, DatabaseTable table) onAttachTable;
+
+  const _Db2ConnectionTreeItem({
+    required this.connection,
+    required this.active,
+    required this.loadingSchemas,
+    required this.loadingTables,
+    required this.onExpand,
+    required this.onActivate,
+    required this.onEdit,
+    required this.onDelete,
+    required this.onInvalidate,
+    required this.onLoadSchema,
+    required this.onLoadTable,
+    required this.onOpenTableData,
+    required this.onAttachTable,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final connected = connection.session != null;
+    return DatabaseConnectionTreeTile(
+      storageKey: 'db2-${connection.config.endpointName}',
+      name: connection.config.displayName,
+      connected: connected,
+      active: active,
+      connecting: connection.isConnecting,
+      error: connection.connectionError,
+      tags: connection.config.tags,
+      onExpand: () async {
+        await onExpand();
+      },
+      onActivate: onActivate,
+      menuItems: [
+        PopupMenuItem(
+          value: connected ? 'activate' : 'connect',
+          child: DatabaseMenuAction(connected ? 'Set active' : 'Connect'),
+        ),
+        const PopupMenuItem(value: 'edit', child: DatabaseMenuAction('Edit')),
+        PopupMenuItem(
+          value: 'invalidate',
+          enabled: connected,
+          child: const DatabaseMenuAction('Invalidate connection'),
+        ),
+        const PopupMenuItem(
+          value: 'delete',
+          child: DatabaseMenuAction('Delete'),
+        ),
+      ],
+      onMenuSelected: (value) {
+        switch (value) {
+          case 'activate':
+          case 'connect':
+            onActivate();
+            break;
+          case 'edit':
+            onEdit();
+            break;
+          case 'invalidate':
+            onInvalidate();
+            break;
+          case 'delete':
+            onDelete();
+            break;
+        }
+      },
+      children: [
+        if (connection.isConnecting)
+          const TreeItem(
+            icon: Icons.sync,
+            title: 'Connecting...',
+            level: 1,
+            showArrow: false,
+          )
+        else if (connection.connectionError != null)
+          TreeItem(
+            icon: Icons.error_outline,
+            title: 'Connection failed',
+            level: 1,
+            showArrow: false,
+            onTap: () => unawaited(onExpand()),
+          )
+        else if (!connected)
+          const TreeItem(
+            icon: Icons.power_settings_new,
+            title: 'Expand to connect',
+            level: 1,
+            showArrow: false,
+          )
+        else
+          for (final schema in connection.schemas)
+            _SchemaTreeItem(
+              connectionKey: connection.config.endpointName,
+              schema: schema,
+              isLoading: loadingSchemas.contains(
+                '${connection.config.endpointName}.${schema.name}',
+              ),
+              onExpand: () => onLoadSchema(schema),
+              onSelectSchema: (schemaName) async {},
+              onRefresh: () => unawaited(onLoadSchema(schema)),
+              onCopyName: (name) async {
+                await Clipboard.setData(ClipboardData(text: name));
+              },
+              onAddToAiContext: () {},
+              tableBuilder: (table) => _TableTreeItem(
+                connectionKey: connection.config.endpointName,
+                schema: schema.name,
+                table: table,
+                isLoading: loadingTables.contains(
+                  '${connection.config.endpointName}.${schema.name}.${table.name}',
+                ),
+                onExpand: (schemaName, table) => onLoadTable(schemaName, table),
+                onOpenTable: (schemaName, tableName) =>
+                    onOpenTableData(schemaName, table, 'Data'),
+                onGenerateSql: (schemaName, table, statement) async {},
+                onOpenTableData: (schemaName, table) =>
+                    onOpenTableData(schemaName, table, 'Data'),
+                onOpenTableProperties: (schemaName, table) =>
+                    onOpenTableData(schemaName, table, 'Properties'),
+                onCopyName: (name) async {
+                  await Clipboard.setData(ClipboardData(text: name));
+                },
+                onAddToAiContext: () =>
+                    unawaited(onAttachTable(schema.name, table)),
+                onRefresh: () => unawaited(onLoadSchema(schema)),
+              ),
+            ),
+      ],
+    );
+  }
+}
 
 class _MySqlConnectionTreeItem extends StatelessWidget {
   final _OpenMySqlConnection connection;

@@ -1,5 +1,7 @@
+import '../../database/drivers/db2_driver.dart';
 import '../../database/drivers/mysql_driver.dart';
 import '../../database/models/database_schema.dart';
+import '../../database/services/db2_database.dart';
 import '../../database/services/mysql_database.dart';
 import '../../database/services/postgres_database.dart';
 
@@ -37,6 +39,26 @@ class OpenMySqlConnection {
     this.isConnecting = false,
     this.connectionError,
   }) : tables = List<DatabaseTable>.of(tables);
+
+  bool get connected => session != null;
+}
+
+class OpenDb2Connection {
+  Db2ConnectionConfig config;
+  Db2BackendDatabase? database;
+  Db2Session? session;
+  List<DatabaseSchema> schemas;
+  bool isConnecting;
+  String? connectionError;
+
+  OpenDb2Connection({
+    required this.config,
+    this.database,
+    this.session,
+    List<DatabaseSchema> schemas = const [],
+    this.isConnecting = false,
+    this.connectionError,
+  }) : schemas = List<DatabaseSchema>.of(schemas);
 
   bool get connected => session != null;
 }
